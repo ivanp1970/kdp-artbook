@@ -2,14 +2,14 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { jsPDF } from "jspdf";
 
 /**
- * KDP ArtBook Builder – Caravaggio (v5)
+ * KDP ArtBook Builder – Caravaggio (v6)
  *
- * Novità principali
- * - 🔍 "Anteprima 1:1" della doppia pagina in modale con zoom 50–200% e guide margini
- * - 🅰️ Rendering del testo nell'anteprima con stessi pt/interlinea/font del PDF
- * - 🖼️ Toggle "Immagine sinistra a piena pagina (bleed)" per simulare foto a vivo
- * - 📐 Formati aggiuntivi "fotolibro": 9×12, 10×13, 11×14 + Quadrato 10×10 + "Personalizzato"
- * - ✅ KDP checker aggiornato (pagine minime, margini, bleed, DPI)
+ * Novità:
+ * - Ridimensiona immagine per opera: scala (%) + offset X/Y (cover/crop o dentro i margini)
+ * - Override dimensione testo per opera
+ * - Anteprima 1:1 aggiornata (rispetta scala/offset/text override)
+ * - Salva bozza (file .kdpbook.json) + Carica bozza (nessun DB richiesto)
+ * - KDP checker (pagine minime, margini, DPI), formati fotolibro e bleed
  */
 
 const TRIMS = [
@@ -17,9 +17,9 @@ const TRIMS = [
   { key: "8x10", w: 8, h: 10, label: "8 × 10 in (20.32 × 25.4 cm)" },
   { key: "8.25x11", w: 8.25, h: 11, label: "8.25 × 11 in (20.96 × 27.94 cm)" },
   { key: "8.5x11", w: 8.5, h: 11, label: "8.5 × 11 in (21.59 × 27.94 cm)" },
-  { key: "9x12", w: 9, h: 12, label: "9 × 12 in (22.86 × 30.48 cm) – fotolibro" },
-  { key: "10x13", w: 10, h: 13, label: "10 × 13 in (25.4 × 33.02 cm) – fotolibro" },
-  { key: "11x14", w: 11, h: 14, label: "11 × 14 in (27.94 × 35.56 cm) – fotolibro" },
+  { key: "9x12", w: 9, h: 12, label: "9 × 12 in – fotolibro" },
+  { key: "10x13", w: 10, h: 13, label: "10 × 13 in – fotolibro" },
+  { key: "11x14", w: 11, h: 14, label: "11 × 14 in – fotolibro" },
   { key: "square8.25", w: 8.25, h: 8.25, label: "Quadrato 8.25 × 8.25 in" },
   { key: "square10", w: 10, h: 10, label: "Quadrato 10 × 10 in – fotolibro" },
   { key: "custom", w: 9.8, h: 13.4, label: "Personalizzato (imposta sotto)" }, // ~25×34 cm
@@ -31,29 +31,33 @@ const INK_OPTIONS = [
   { key: "bw", label: "B/N" },
 ];
 
+const CSS_PPI = 96; // px/inch per anteprima a schermo
+
 function pxNeeded(widthIn, heightIn, dpi = 300) {
   return { w: Math.round(widthIn * dpi), h: Math.round(heightIn * dpi) };
 }
-
 function calcBleedSize(trimW, trimH, bleed) {
   if (!bleed) return { w: trimW, h: trimH };
-  // KDP bleed: +0.125" W, +0.25" H (0.125" per lato alto/basso)
+  // KDP bleed: +0.125" W, +0.25" H
   return { w: trimW + 0.125, h: trimH + 0.25 };
 }
 
 export default function KdpArtBookBuilder() {
   const fileInputRef = useRef(null);
-  const [items, setItems] = useState([]); // { id, name, src, width, height, title, description, warnings:[] }
+  const draftFileInputRef = useRef(null);
+
+  // immagini/items
+  const [items, setItems] = useState([]); // {id,name,src,width,height,title,description,warnings,scalePct,offX,offY,textSize}
   const [selectedIndex, setSelectedIndex] = useState(0);
 
-  // --- Dati libro ---
+  // libro
   const [bookTitle, setBookTitle] = useState("Caravaggio – Opere");
   const [author, setAuthor] = useState("");
   const [includeTitlePage, setIncludeTitlePage] = useState(true);
   const [inkType, setInkType] = useState("premium_color");
 
-  // --- Impaginazione ---
-  const [trimKey, setTrimKey] = useState("8.25x11"); // default "grande"
+  // impaginazione
+  const [trimKey, setTrimKey] = useState("8.25x11");
   const [customW, setCustomW] = useState(9.8);
   const [customH, setCustomH] = useState(13.4);
   const baseTrim = useMemo(() => {
@@ -68,7 +72,7 @@ export default function KdpArtBookBuilder() {
   const [lineHeight, setLineHeight] = useState(1.35);
   const [useSerif, setUseSerif] = useState(true);
 
-  // --- AI (client) ---
+  // AI
   const [apiKey, setApiKey] = useState("");
   useEffect(() => {
     const k = localStorage.getItem("OPENAI_API_KEY") || "";
@@ -76,27 +80,24 @@ export default function KdpArtBookBuilder() {
   }, []);
   function saveKey() {
     localStorage.setItem("OPENAI_API_KEY", apiKey || "");
-    alert("Chiave salvata solo su questo browser.");
+    alert("Chiave salvata sul browser attuale.");
   }
 
-  // --- Anteprima 1:1 ---
+  // anteprima 1:1
   const [previewOpen, setPreviewOpen] = useState(false);
-  const [previewZoom, setPreviewZoom] = useState(1); // 1 = 100%
+  const [previewZoom, setPreviewZoom] = useState(1);
   const [showGuides, setShowGuides] = useState(true);
-  const CSS_PPI = 96; // pt→px approx nel browser
 
   const trimWithBleed = useMemo(
     () => calcBleedSize(baseTrim.w, baseTrim.h, bleed),
     [baseTrim, bleed]
   );
-
   const fontClass = useSerif ? "font-serif" : "font-sans";
 
-  // --- Import immagini ---
+  // ---------- Import immagini ----------
   function onFilesSelected(files) {
     const arr = Array.from(files || []);
     if (!arr.length) return;
-
     const readers = arr.map((file, idx) =>
       new Promise((resolve) => {
         const reader = new FileReader();
@@ -113,6 +114,10 @@ export default function KdpArtBookBuilder() {
               title: file.name.replace(/\.[^/.]+$/, ""),
               description: "",
               warnings: [],
+              scalePct: 100,
+              offX: 0, // -50..50 (%)
+              offY: 0, // -50..50 (%)
+              textSize: null, // override (pt) o null per usare globale
             });
           };
           img.src = src;
@@ -120,7 +125,6 @@ export default function KdpArtBookBuilder() {
         reader.readAsDataURL(file);
       })
     );
-
     Promise.all(readers).then((newItems) => {
       const validated = newItems.map((it) => ({ ...it, warnings: validateImage(it) }));
       setItems((prev) => {
@@ -131,7 +135,7 @@ export default function KdpArtBookBuilder() {
     });
   }
 
-  // --- Validazione immagini (DPI target 300) ---
+  // ---------- Validazione immagini (DPI 300) ----------
   function validateImage(it) {
     const { w: pageW, h: pageH } = trimWithBleed;
     const m = marginIn;
@@ -141,37 +145,39 @@ export default function KdpArtBookBuilder() {
     const warns = [];
     if (it.width < needs.w || it.height < needs.h) {
       warns.push(
-        `Risoluzione bassa: minimo ${needs.w}×${needs.h}px per ${fullBleedLeft ? "piena pagina con bleed" : "area utile"}. Hai ${it.width}×${it.height}px.`
+        `Risoluzione bassa: minimo ${needs.w}×${needs.h}px per ${
+          fullBleedLeft ? "piena pagina con bleed" : "area utile"
+        }. Hai ${it.width}×${it.height}px.`
       );
     }
-    if (fullBleedLeft && !bleed) {
-      warns.push("Hai attivato 'piena pagina' ma il bleed è OFF. Attiva il bleed per stampa a vivo.");
-    }
+    if (fullBleedLeft && !bleed) warns.push("‘Piena pagina’ ON ma bleed OFF: attiva bleed per stampa a vivo.");
     return warns;
   }
   function revalidateAll() {
     setItems((prev) => prev.map((it) => ({ ...it, warnings: validateImage(it) })));
   }
+  useEffect(() => {
+    revalidateAll();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trimKey, customW, customH, bleed, fullBleedLeft, marginIn]);
 
-  // --- Gestione elenco ---
+  // ---------- CRUD lista ----------
   function removeItem(index) {
     setItems((prev) => {
       const copy = [...prev];
       copy.splice(index, 1);
-      let nextSelected = selectedIndex;
-      if (index === selectedIndex) nextSelected = Math.max(0, selectedIndex - 1);
-      setSelectedIndex(nextSelected);
+      setSelectedIndex((s) => Math.min(s, Math.max(0, copy.length - 1)));
       return copy;
     });
   }
   function moveItem(index, dir) {
     setItems((prev) => {
       const copy = [...prev];
-      const newIndex = index + dir;
-      if (newIndex < 0 || newIndex >= copy.length) return prev;
+      const n = index + dir;
+      if (n < 0 || n >= copy.length) return prev;
       const [moved] = copy.splice(index, 1);
-      copy.splice(newIndex, 0, moved);
-      setSelectedIndex(newIndex);
+      copy.splice(n, 0, moved);
+      setSelectedIndex(n);
       return copy;
     });
   }
@@ -183,7 +189,7 @@ export default function KdpArtBookBuilder() {
     });
   }
 
-  // --- AI ---
+  // ---------- AI ----------
   async function generateWithAI(index) {
     const it = items[index];
     if (!it) return;
@@ -215,18 +221,61 @@ export default function KdpArtBookBuilder() {
     }
   }
 
-  // --- Export PDF ---
+  // ---------- Calcolo immagine (PDF e Anteprima) ----------
+  function computeImageDraw(it, pageW, pageH, m) {
+    const scale = Math.max(0.1, (it.scalePct || 100) / 100);
+    let drawW, drawH, offsetX, offsetY;
+
+    if (fullBleedLeft) {
+      // COVER: riempi tutta la pagina (può tagliare ai bordi)
+      const imgR = it.width / it.height;
+      const pageR = pageW / pageH;
+      if (imgR > pageR) {
+        drawH = pageH * scale;
+        drawW = pageH * imgR * scale;
+      } else {
+        drawW = pageW * scale;
+        drawH = (pageW / imgR) * scale;
+      }
+      // offset percentuale -50..50 → sposta all'interno del crop
+      const ox = ((it.offX || 0) / 100) * (drawW - pageW);
+      const oy = ((it.offY || 0) / 100) * (drawH - pageH);
+      offsetX = (pageW - drawW) / 2 + ox;
+      offsetY = (pageH - drawH) / 2 + oy;
+    } else {
+      // CONTAIN: dentro i margini
+      const boxW = pageW - m * 2;
+      const boxH = pageH - m * 2;
+      const imgR = it.width / it.height;
+      const boxR = boxW / boxH;
+      if (imgR > boxR) {
+        drawW = boxW * scale;
+        drawH = (boxW / imgR) * scale;
+      } else {
+        drawH = boxH * scale;
+        drawW = (boxH * imgR) * scale;
+      }
+      const freeX = Math.max(0, (pageW - drawW) / 2 - 0); // spazio residuo
+      const freeY = Math.max(0, (pageH - drawH) / 2 - 0);
+      const ox = ((it.offX || 0) / 100) * Math.max(0, (pageW - drawW) / 2);
+      const oy = ((it.offY || 0) / 100) * Math.max(0, (pageH - drawH) / 2);
+      offsetX = (pageW - drawW) / 2 + ox;
+      offsetY = (pageH - drawH) / 2 + oy;
+    }
+    return { drawW, drawH, offsetX, offsetY };
+  }
+
+  // ---------- Export PDF ----------
   async function exportToPdf() {
     if (!items.length) {
       alert("Carica almeno una immagine.");
       return;
     }
-
     const { w: pageW, h: pageH } = trimWithBleed;
     const doc = new jsPDF({ unit: "in", format: [pageW, pageH], orientation: "portrait" });
     const m = marginIn;
 
-    // Pagina del titolo
+    // frontespizio
     if (includeTitlePage) {
       doc.setFont(useSerif ? "Times" : "Helvetica", "bold");
       doc.setFontSize(22);
@@ -240,41 +289,11 @@ export default function KdpArtBookBuilder() {
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
 
-      // --- Pagina sinistra (immagine) ---
-      let drawW, drawH, offsetX, offsetY;
-      if (fullBleedLeft) {
-        // Riempie tutta la pagina (può tagliare ai bordi) – ideale per foto a vivo
-        const imgRatio = it.width / it.height;
-        const pageRatio = pageW / pageH;
-        if (imgRatio > pageRatio) {
-          drawH = pageH;
-          drawW = pageH * imgRatio;
-        } else {
-          drawW = pageW;
-          drawH = pageW / imgRatio;
-        }
-        offsetX = (pageW - drawW) / 2; // può essere negativo → crop
-        offsetY = (pageH - drawH) / 2;
-      } else {
-        // Dentro i margini
-        const boxW = pageW - m * 2;
-        const boxH = pageH - m * 2;
-        const imgRatio = it.width / it.height;
-        const boxRatio = boxW / boxH;
-        if (imgRatio > boxRatio) {
-          drawW = boxW;
-          drawH = boxW / imgRatio;
-        } else {
-          drawH = boxH;
-          drawW = boxH * imgRatio;
-        }
-        offsetX = (pageW - drawW) / 2;
-        offsetY = (pageH - drawH) / 2;
-      }
-
+      // sinistra: immagine
+      const { drawW, drawH, offsetX, offsetY } = computeImageDraw(it, pageW, pageH, m);
       try {
         doc.addImage(it.src, "JPEG", offsetX, offsetY, drawW, drawH, undefined, "FAST");
-      } catch (e) {
+      } catch {
         try {
           doc.addImage(it.src, "PNG", offsetX, offsetY, drawW, drawH, undefined, "FAST");
         } catch (e2) {
@@ -282,84 +301,149 @@ export default function KdpArtBookBuilder() {
         }
       }
 
-      // --- Pagina destra (testo) ---
+      // destra: testo
       doc.addPage();
+      const titleSize = (it.textSize ? it.textSize : fontSize) + 3;
+      const bodySize = it.textSize ? it.textSize : fontSize;
+
       doc.setFont(useSerif ? "Times" : "Helvetica", "bold");
-      doc.setFontSize(fontSize + 3);
+      doc.setFontSize(titleSize);
       doc.text(it.title || "", m, m);
 
       doc.setFont(useSerif ? "Times" : "Helvetica", "normal");
-      doc.setFontSize(fontSize);
+      doc.setFontSize(bodySize);
       const text = (it.description || "").replace(/\r\n|\r/g, "\n");
       const maxWidth = pageW - m * 2;
       const lines = doc.splitTextToSize(text, maxWidth);
-      const leading = (fontSize / 72) * lineHeight; // in
-      let cursorY = m + 0.35;
+      const leading = (bodySize / 72) * lineHeight; // in
+      let y = m + 0.35;
       lines.forEach((ln) => {
-        if (cursorY > pageH - m) {
+        if (y > pageH - m) {
           doc.addPage();
-          cursorY = m;
+          y = m;
         }
-        doc.text(ln, m, cursorY);
-        cursorY += leading;
+        doc.text(ln, m, y);
+        y += leading;
       });
 
-      // Mantieni pagine pari (spread intere)
-      const totalPages = doc.getNumberOfPages();
-      if (totalPages % 2 !== 0 && i < items.length - 1) {
-        doc.addPage();
-      }
+      // mantieni pari
+      const total = doc.getNumberOfPages();
+      if (total % 2 !== 0 && i < items.length - 1) doc.addPage();
     }
 
-    // Nome file robusto
     const safeTitle = (bookTitle || "Caravaggio ArtBook")
       .normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
       .replace(/[^a-z0-9 _-]/gi, "_").trim().replace(/\s+/g, "_");
-    const fname = safeTitle + (bleed ? "_BLEED" : "") + ".pdf";
-    doc.save(fname);
+    doc.save(safeTitle + (bleed ? "_BLEED" : "") + ".pdf");
   }
 
-  // --- KDP Checker ---
+  // ---------- KDP checker ----------
   function kdpCheck() {
     const issues = [];
-
-    // Pagine minime
-    const pageCountEstimate = (includeTitlePage ? 1 : 0) + items.length * 2;
-    if (inkType === "standard_color" && pageCountEstimate < 72) {
-      issues.push(`Pagine minime Standard Color: 72. Attuali: ${pageCountEstimate}.`);
-    }
-    if ((inkType === "premium_color" || inkType === "bw") && pageCountEstimate < 24) {
-      issues.push(`Pagine minime: 24. Attuali: ${pageCountEstimate}.`);
-    }
-
-    // Margini minimi
+    const pageCount = (includeTitlePage ? 1 : 0) + items.length * 2;
+    if (inkType === "standard_color" && pageCount < 72) issues.push(`Pagine minime Standard Color: 72 (attuali ${pageCount}).`);
+    if ((inkType === "premium_color" || inkType === "bw") && pageCount < 24) issues.push(`Pagine minime: 24 (attuali ${pageCount}).`);
     const outsideMin = bleed ? 0.375 : 0.25;
-    if (marginIn < outsideMin) {
-      issues.push(`Margine esterno troppo piccolo: ${marginIn}" (min ${outsideMin}"${bleed ? " con bleed" : ""}).`);
-    }
-
-    // Formati molto grandi (solo simulazione)
-    if (["9x12","10x13","11x14","square10","custom"].includes(baseTrim.key)) {
-      issues.push("Formato simulato tipo 'coffee-table'. Verifica su KDP: i formati grandi più comuni sono 8.25×11 e 8.5×11.");
-    }
-
-    // DPI immagini
+    if (marginIn < outsideMin) issues.push(`Margine esterno troppo piccolo: ${marginIn}" (min ${outsideMin}"${bleed ? " con bleed" : ""}).`);
+    if (fullBleedLeft && !bleed) issues.push("‘Piena pagina’ ON ma bleed OFF.");
     items.forEach((it, i) => {
       const warns = validateImage(it);
       if (warns.length) issues.push(`Opera #${i + 1} (${it.title}): ${warns.join(" ")}`);
     });
-
     alert(issues.length ? `Problemi:\n- ` + issues.join("\n- ") : "Nessun problema critico.");
   }
 
-  useEffect(() => {
-    revalidateAll();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [trimKey, customW, customH, bleed, fullBleedLeft, marginIn]);
+  // ---------- Bozze: salva/carica (file) ----------
+  function buildDraft() {
+    return {
+      version: 3,
+      book: {
+        bookTitle,
+        author,
+        includeTitlePage,
+        inkType,
+        trimKey,
+        customW,
+        customH,
+        bleed,
+        fullBleedLeft,
+        marginIn,
+        fontSize,
+        lineHeight,
+        useSerif,
+      },
+      items: items.map((it) => ({
+        name: it.name,
+        src: it.src, // dataURL; file singolo si porta dietro tutto
+        width: it.width,
+        height: it.height,
+        title: it.title,
+        description: it.description,
+        scalePct: it.scalePct,
+        offX: it.offX,
+        offY: it.offY,
+        textSize: it.textSize,
+      })),
+    };
+  }
+  function saveDraftToFile() {
+    const data = buildDraft();
+    const title = (bookTitle || "Caravaggio ArtBook").replace(/[^a-z0-9 _-]/gi, "_").trim().replace(/\s+/g, "_");
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${title}.kdpbook.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+  function loadDraftFromFile(file) {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target.result);
+        if (!data?.book || !Array.isArray(data?.items)) throw new Error("File bozza non valido.");
+        const b = data.book;
+        setBookTitle(b.bookTitle || "");
+        setAuthor(b.author || "");
+        setIncludeTitlePage(!!b.includeTitlePage);
+        setInkType(b.inkType || "premium_color");
+        setTrimKey(b.trimKey || "8.25x11");
+        setCustomW(parseFloat(b.customW) || 9.8);
+        setCustomH(parseFloat(b.customH) || 13.4);
+        setBleed(!!b.bleed);
+        setFullBleedLeft(!!b.fullBleedLeft);
+        setMarginIn(parseFloat(b.marginIn) || 0.5);
+        setFontSize(parseInt(b.fontSize || 11));
+        setLineHeight(parseFloat(b.lineHeight || 1.35));
+        setUseSerif(!!b.useSerif);
+
+        const its = data.items.map((it, idx) => ({
+          id: `${Date.now()}_${idx}`,
+          name: it.name || `img_${idx + 1}`,
+          src: it.src,
+          width: it.width,
+          height: it.height,
+          title: it.title || "",
+          description: it.description || "",
+          warnings: [],
+          scalePct: it.scalePct ?? 100,
+          offX: it.offX ?? 0,
+          offY: it.offY ?? 0,
+          textSize: it.textSize ?? null,
+        }));
+        setItems(its);
+        setSelectedIndex(0);
+        setTimeout(() => revalidateAll(), 0);
+      } catch (err) {
+        alert("Errore nel caricamento della bozza: " + (err?.message || ""));
+      }
+    };
+    reader.readAsText(file);
+  }
 
   const selected = items[selectedIndex];
 
-  // --- Modale Anteprima 1:1 ---
+  // ---------- Modale Anteprima 1:1 ----------
   function SpreadPreviewModal() {
     if (!previewOpen || !selected) return null;
 
@@ -368,9 +452,17 @@ export default function KdpArtBookBuilder() {
     const pageHpx = Math.round(pageHIn * CSS_PPI * previewZoom);
     const mPx = Math.round(marginIn * CSS_PPI * previewZoom);
 
-    const fontPx = (fontSize / 72) * CSS_PPI * previewZoom; // pt→px
-    const titleExtraPx = (3 / 72) * CSS_PPI * previewZoom;
+    const bodySizePt = selected.textSize ? selected.textSize : fontSize;
+    const fontPx = (bodySizePt / 72) * CSS_PPI * previewZoom;
+    const titlePx = ((bodySizePt + 3) / 72) * CSS_PPI * previewZoom;
     const text = (selected.description || "").replace(/\r\n|\r/g, "\n");
+
+    // calcola draw immagine in pollici ⇒ converti in px
+    const { drawW, drawH, offsetX, offsetY } = computeImageDraw(selected, pageWIn, pageHIn, marginIn);
+    const drawWpx = Math.round(drawW * CSS_PPI * previewZoom);
+    const drawHpx = Math.round(drawH * CSS_PPI * previewZoom);
+    const offXpx = Math.round(offsetX * CSS_PPI * previewZoom);
+    const offYpx = Math.round(offsetY * CSS_PPI * previewZoom);
 
     return (
       <div className="fixed inset-0 z-50 flex flex-col bg-black/70">
@@ -386,28 +478,63 @@ export default function KdpArtBookBuilder() {
         </div>
 
         <div className="flex-1 overflow-auto p-6">
-          <div className="mx-auto flex gap-6" style={{ width: pageWpx*2 + 80 }}>
+          <div className="mx-auto flex gap-6" style={{ width: pageWpx * 2 + 80 }}>
             {/* Sinistra: immagine */}
-            <div className="relative bg-white shadow rounded" style={{ width: pageWpx, height: pageHpx }}>
+            <div className="relative bg-white shadow rounded overflow-hidden" style={{ width: pageWpx, height: pageHpx }}>
               {showGuides && (
-                <div className="absolute inset-0 border border-emerald-500/50 pointer-events-none" style={{ boxShadow: `inset ${mPx}px 0 0 0 rgba(16,185,129,0.15), inset -${mPx}px 0 0 0 rgba(16,185,129,0.15), inset 0 ${mPx}px 0 0 rgba(16,185,129,0.15), inset 0 -${mPx}px 0 0 rgba(16,185,129,0.15)` }} />
+                <div
+                  className="absolute inset-0 border border-emerald-500/50 pointer-events-none"
+                  style={{ boxShadow: `inset ${mPx}px 0 0 0 rgba(16,185,129,0.15), inset -${mPx}px 0 0 0 rgba(16,185,129,0.15), inset 0 ${mPx}px 0 0 rgba(16,185,129,0.15), inset 0 -${mPx}px 0 0 rgba(16,185,129,0.15)` }}
+                />
               )}
-              <div className="absolute" style={{ left: fullBleedLeft?0:mPx, top: fullBleedLeft?0:mPx, right: fullBleedLeft?0:mPx, bottom: fullBleedLeft?0:mPx, display:'flex', alignItems:'center', justifyContent:'center' }}>
-                <img src={selected.src} alt={selected.name} style={{ width:'100%', height:'100%', objectFit: fullBleedLeft? 'cover':'contain' }} />
-              </div>
+              <img
+                src={selected.src}
+                alt={selected.name}
+                style={{
+                  position: "absolute",
+                  left: offXpx,
+                  top: offYpx,
+                  width: drawWpx,
+                  height: drawHpx,
+                  objectFit: "fill",
+                }}
+              />
             </div>
 
             {/* Destra: testo */}
             <div className="relative bg-white shadow rounded" style={{ width: pageWpx, height: pageHpx }}>
               {showGuides && (
-                <div className="absolute inset-0 border border-emerald-500/50 pointer-events-none" style={{ boxShadow: `inset ${mPx}px 0 0 0 rgba(16,185,129,0.15), inset -${mPx}px 0 0 0 rgba(16,185,129,0.15), inset 0 ${mPx}px 0 0 rgba(16,185,129,0.15), inset 0 -${mPx}px 0 0 rgba(16,185,129,0.15)` }} />
+                <div
+                  className="absolute inset-0 border border-emerald-500/50 pointer-events-none"
+                  style={{ boxShadow: `inset ${mPx}px 0 0 0 rgba(16,185,129,0.15), inset -${mPx}px 0 0 0 rgba(16,185,129,0.15), inset 0 ${mPx}px 0 0 rgba(16,185,129,0.15), inset 0 -${mPx}px 0 0 rgba(16,185,129,0.15)` }}
+                />
               )}
-              <div className="absolute overflow-auto" style={{ left: mPx, top: mPx + Math.round(0.35*CSS_PPI*previewZoom), right: mPx, bottom: mPx }}>
-                <div style={{ fontWeight:700, fontFamily: useSerif? 'Times, serif':'Helvetica, Arial, sans-serif', fontSize: fontPx + titleExtraPx, marginBottom: 8 }}>
+              <div
+                className="absolute overflow-auto"
+                style={{ left: mPx, top: mPx + Math.round(0.35 * CSS_PPI * previewZoom), right: mPx, bottom: mPx }}
+              >
+                <div
+                  style={{
+                    fontWeight: 700,
+                    fontFamily: useSerif ? "Times, serif" : "Helvetica, Arial, sans-serif",
+                    fontSize: titlePx,
+                    marginBottom: 8,
+                  }}
+                >
                   {selected.title || selected.name}
                 </div>
-                <div style={{ fontFamily: useSerif? 'Times, serif':'Helvetica, Arial, sans-serif', fontSize: fontPx, lineHeight: lineHeight }}>
-                  {text.split('\n').map((ln, i)=> <p key={i} style={{ margin: 0 }}>{ln}</p>)}
+                <div
+                  style={{
+                    fontFamily: useSerif ? "Times, serif" : "Helvetica, Arial, sans-serif",
+                    fontSize: fontPx,
+                    lineHeight: lineHeight,
+                  }}
+                >
+                  {text.split("\n").map((ln, i) => (
+                    <p key={i} style={{ margin: 0 }}>
+                      {ln}
+                    </p>
+                  ))}
                 </div>
               </div>
             </div>
@@ -417,24 +544,27 @@ export default function KdpArtBookBuilder() {
     );
   }
 
-  // --- UI ---
+  // ---------- UI ----------
   return (
     <div className={`min-h-screen ${fontClass} bg-neutral-50`}>
       <SpreadPreviewModal />
       <div className="max-w-7xl mx-auto p-6">
-        <header className="mb-6 flex items-center justify-between gap-4">
+        <header className="mb-6 flex items-center gap-2 justify-between">
           <div>
             <h1 className="text-2xl font-bold">KDP ArtBook Builder – Caravaggio</h1>
             <p className="text-sm text-neutral-600">Doppia pagina: sinistra immagine, destra testo • PDF pronto KDP</p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <button onClick={()=>setPreviewOpen(true)} className="px-3 py-2 rounded-2xl border shadow-sm">Anteprima 1:1</button>
             <button onClick={kdpCheck} className="px-3 py-2 rounded-2xl border shadow-sm">KDP Checker</button>
+            <button onClick={saveDraftToFile} className="px-3 py-2 rounded-2xl border shadow-sm">Salva bozza (file)</button>
+            <button onClick={()=>draftFileInputRef.current?.click()} className="px-3 py-2 rounded-2xl border shadow-sm">Carica bozza</button>
+            <input ref={draftFileInputRef} type="file" accept=".json,.kdpbook.json,application/json" className="hidden" onChange={(e)=> e.target.files?.[0] && loadDraftFromFile(e.target.files[0]) }/>
             <button onClick={exportToPdf} className="px-4 py-2 rounded-2xl shadow bg-black text-white hover:opacity-90">Esporta PDF</button>
           </div>
         </header>
 
-        {/* Impostazioni */}
+        {/* impostazioni */}
         <section className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
           <div className="bg-white rounded-2xl shadow p-4">
             <h2 className="font-semibold mb-3">Dettagli libro</h2>
@@ -458,7 +588,8 @@ export default function KdpArtBookBuilder() {
             <select value={trimKey} onChange={(e)=>setTrimKey(e.target.value)} className="w-full border rounded-xl px-3 py-2 mb-3">
               {TRIMS.map(t=> <option key={t.key} value={t.key}>{t.label}</option>)}
             </select>
-            {trimKey === 'custom' && (
+
+            {trimKey === "custom" && (
               <div className="grid grid-cols-2 gap-2 mb-3">
                 <div>
                   <label className="block text-xs mb-1">Larghezza (in)</label>
@@ -468,31 +599,30 @@ export default function KdpArtBookBuilder() {
                   <label className="block text-xs mb-1">Altezza (in)</label>
                   <input type="number" step="0.01" min="6" value={customH} onChange={(e)=>setCustomH(parseFloat(e.target.value)||customH)} className="w-full border rounded-xl px-3 py-2"/>
                 </div>
-                <p className="col-span-2 text-[11px] text-neutral-500">Formati grandi simulati stile coffee-table. Su KDP i più comuni sono 8.25×11" e 8.5×11".</p>
+                <p className="col-span-2 text-[11px] text-neutral-500">Formati grandi stile coffee-table (simulazione). Su KDP i più comuni: 8.25×11" e 8.5×11".</p>
               </div>
             )}
+
             <label className="inline-flex items-center gap-2 text-sm mb-2">
-              <input type="checkbox" checked={bleed} onChange={(e)=>setBleed(e.target.checked)} />
-              Con bleed (+0.125" W, +0.25" H)
+              <input type="checkbox" checked={bleed} onChange={(e)=>setBleed(e.target.checked)} /> Con bleed (+0.125" W, +0.25" H)
             </label>
             <label className="inline-flex items-center gap-2 text-sm mb-3">
-              <input type="checkbox" checked={fullBleedLeft} onChange={(e)=>setFullBleedLeft(e.target.checked)} />
-              Immagine sinistra a piena pagina (bleed)
+              <input type="checkbox" checked={fullBleedLeft} onChange={(e)=>setFullBleedLeft(e.target.checked)} /> Immagine sinistra a piena pagina
             </label>
+
             <label className="block text-sm mb-1">Margini (in)</label>
             <input type="number" step="0.1" min="0" value={marginIn} onChange={(e)=>setMarginIn(parseFloat(e.target.value)||0)} className="w-full border rounded-xl px-3 py-2 mb-1"/>
             <p className="text-xs text-neutral-500">Minimi KDP: 0.25" (no bleed) • 0.375" (con bleed).</p>
           </div>
 
           <div className="bg-white rounded-2xl shadow p-4">
-            <h2 className="font-semibold mb-3">Testo</h2>
+            <h2 className="font-semibold mb-3">Testo (globale)</h2>
             <label className="block text-sm mb-1">Dimensione font (pt)</label>
             <input type="number" step="1" min="8" value={fontSize} onChange={(e)=>setFontSize(parseInt(e.target.value)||11)} className="w-full border rounded-xl px-3 py-2 mb-3"/>
             <label className="block text-sm mb-1">Interlinea</label>
             <input type="number" step="0.05" min="1" value={lineHeight} onChange={(e)=>setLineHeight(parseFloat(e.target.value)||1.35)} className="w-full border rounded-xl px-3 py-2 mb-3"/>
             <label className="inline-flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={useSerif} onChange={(e)=>setUseSerif(e.target.checked)} />
-              Usa font con grazie (serif)
+              <input type="checkbox" checked={useSerif} onChange={(e)=>setUseSerif(e.target.checked)} /> Usa font con grazie (serif)
             </label>
           </div>
 
@@ -504,13 +634,13 @@ export default function KdpArtBookBuilder() {
               <button onClick={saveKey} className="px-3 py-2 rounded-xl border shadow-sm">Salva chiave</button>
               <button onClick={()=>setPreviewOpen(true)} className="px-3 py-2 rounded-xl border shadow-sm">Anteprima 1:1</button>
             </div>
-            <p className="text-xs text-neutral-500 mt-2">La chiave viene salvata nel tuo browser. Versione server /api disponibile in alternativa.</p>
+            <p className="text-xs text-neutral-500 mt-2">La chiave resta sul tuo dispositivo. Per sicurezza totale usa un endpoint /api.</p>
           </div>
         </section>
 
-        {/* Colonne */}
+        {/* area lavoro */}
         <section className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          {/* Elenco opere */}
+          {/* elenco */}
           <div className="bg-white rounded-2xl shadow p-4 h-[70vh] overflow-auto">
             <div className="flex items-center justify-between mb-3">
               <h3 className="font-semibold">Opere ({items.length})</h3>
@@ -521,7 +651,7 @@ export default function KdpArtBookBuilder() {
               <p className="text-xs text-neutral-500 mt-1">JPG/PNG ad alta risoluzione consigliati</p>
               <input ref={fileInputRef} type="file" accept="image/*" multiple className="hidden" onChange={(e)=>onFilesSelected(e.target.files)} />
             </div>
-            {items.length === 0 && (<p className="text-sm text-neutral-500">Nessuna immagine. Importane alcune per iniziare.</p>)}
+            {items.length === 0 && <p className="text-sm text-neutral-500">Nessuna immagine. Importane alcune per iniziare.</p>}
             <ul className="space-y-2">
               {items.map((it, idx) => (
                 <li key={it.id} className={`rounded-xl border p-2 flex items-center gap-2 ${idx===selectedIndex?"ring-2 ring-black":""}`}>
@@ -545,17 +675,39 @@ export default function KdpArtBookBuilder() {
             </ul>
           </div>
 
-          {/* Anteprima ridotta */}
+          {/* anteprima ridotta */}
           <div className="bg-white rounded-2xl shadow p-4 h-[70vh] overflow-auto">
-            <h3 className="font-semibold mb-3">Anteprima doppia pagina</h3>
+            <h3 className="font-semibold mb-3">Anteprima doppia pagina (ridotta)</h3>
             {selected ? (
               <div className="grid grid-cols-2 gap-4">
-                <div className="aspect-[2/3] border rounded-xl flex items-center justify-center overflow-hidden bg-neutral-100">
-                  <img src={selected.src} alt={selected.name} className="object-contain max-h-full max-w-full" />
+                <div className="aspect-[2/3] border rounded-xl overflow-hidden relative bg-neutral-100">
+                  {/* draw semplificato in CSS: usiamo compute in px */}
+                  {(() => {
+                    const { w: pageWIn, h: pageHIn } = trimWithBleed;
+                    const { drawW, drawH, offsetX, offsetY } = computeImageDraw(selected, pageWIn, pageHIn, marginIn);
+                    const pw = 300, ph = 450; // proporzione 2/3 per preview
+                    const scaleX = pw / pageWIn, scaleY = ph / pageHIn;
+                    return (
+                      <img
+                        src={selected.src}
+                        alt={selected.name}
+                        style={{
+                          position: "absolute",
+                          left: offsetX * scaleX,
+                          top: offsetY * scaleY,
+                          width: drawW * scaleX,
+                          height: drawH * scaleY,
+                          objectFit: "fill",
+                        }}
+                      />
+                    );
+                  })()}
                 </div>
                 <div className="aspect-[2/3] border rounded-xl p-3 overflow-auto">
                   <h4 className="font-semibold mb-2 break-words">{selected.title || selected.name}</h4>
-                  <div className="max-w-none whitespace-pre-wrap text-sm leading-relaxed">{selected.description || <span className="text-neutral-400">(Nessun testo)</span>}</div>
+                  <div className="max-w-none whitespace-pre-wrap text-sm leading-relaxed">
+                    {selected.description || <span className="text-neutral-400">(Nessun testo)</span>}
+                  </div>
                 </div>
               </div>
             ) : (
@@ -563,31 +715,106 @@ export default function KdpArtBookBuilder() {
             )}
           </div>
 
-          {/* Editor testo */}
+          {/* editor testo + controlli immagine */}
           <div className="bg-white rounded-2xl shadow p-4 h-[70vh] overflow-auto">
-            <h3 className="font-semibold mb-3">Editor testo</h3>
+            <h3 className="font-semibold mb-3">Editor</h3>
             {selected ? (
               <div>
                 <label className="block text-sm mb-1">Titolo opera</label>
                 <input value={selected.title} onChange={(e)=>updateField(selectedIndex,"title",e.target.value)} className="w-full border rounded-xl px-3 py-2 mb-3"/>
 
                 <label className="block text-sm mb-1">Testo (storia, aneddoti, analisi)</label>
-                <textarea value={selected.description} onChange={(e)=>updateField(selectedIndex,"description",e.target.value)} className="w-full h-64 border rounded-xl px-3 py-2 mb-3" placeholder="Scrivi qui o usa 'Genera con AI'" />
+                <textarea value={selected.description} onChange={(e)=>updateField(selectedIndex,"description",e.target.value)} className="w-full h-48 border rounded-xl px-3 py-2 mb-3" placeholder="Scrivi qui o usa 'Genera con AI'"/>
 
-                <div className="flex gap-2">
+                <div className="flex gap-2 mb-4">
                   <button onClick={()=>generateWithAI(selectedIndex)} className="px-3 py-2 rounded-xl border shadow-sm">Genera con AI</button>
-                  <button onClick={()=>updateField(selectedIndex,"description","")} className="px-3 py-2 rounded-xl border shadow-sm">Svuota</button>
-                  <button onClick={()=>setPreviewOpen(true)} className="px-3 py-2 rounded-xl border shadow-sm">Anteprima 1:1</button>
+                  <button onClick={()=>updateField(selectedIndex,"description","")} className="px-3 py-2 rounded-xl border shadow-sm">Svuota testo</button>
+                </div>
+
+                <h4 className="font-semibold mb-2">Testo (override per questa opera)</h4>
+                <div className="grid grid-cols-3 gap-2 mb-4">
+                  <div className="col-span-2">
+                    <label className="block text-xs mb-1">Dimensione (pt)</label>
+                    <input
+                      type="number"
+                      min="8"
+                      step="1"
+                      value={selected.textSize ?? ""}
+                      placeholder={`(usa globale: ${fontSize} pt)`}
+                      onChange={(e)=>updateField(selectedIndex,"textSize", e.target.value === "" ? null : parseInt(e.target.value)||fontSize)}
+                      className="w-full border rounded-xl px-3 py-2"
+                    />
+                  </div>
+                  <div className="flex items-end">
+                    <button
+                      className="px-3 py-2 border rounded-xl w-full"
+                      onClick={()=>updateField(selectedIndex,"textSize",null)}
+                    >
+                      Usa globale
+                    </button>
+                  </div>
+                </div>
+
+                <h4 className="font-semibold mb-2">Immagine (questa opera)</h4>
+                <div className="grid grid-cols-3 gap-2">
+                  <div>
+                    <label className="block text-xs mb-1">Scala (%)</label>
+                    <input
+                      type="range"
+                      min="50"
+                      max="200"
+                      step="1"
+                      value={selected.scalePct}
+                      onChange={(e)=>updateField(selectedIndex,"scalePct", parseInt(e.target.value))}
+                      className="w-full"
+                    />
+                    <div className="text-xs text-neutral-600 text-center mt-1">{selected.scalePct}%</div>
+                  </div>
+                  <div>
+                    <label className="block text-xs mb-1">Offset X (%)</label>
+                    <input
+                      type="range"
+                      min="-50"
+                      max="50"
+                      step="1"
+                      value={selected.offX}
+                      onChange={(e)=>updateField(selectedIndex,"offX", parseInt(e.target.value))}
+                      className="w-full"
+                    />
+                    <div className="text-xs text-neutral-600 text-center mt-1">{selected.offX}%</div>
+                  </div>
+                  <div>
+                    <label className="block text-xs mb-1">Offset Y (%)</label>
+                    <input
+                      type="range"
+                      min="-50"
+                      max="50"
+                      step="1"
+                      value={selected.offY}
+                      onChange={(e)=>updateField(selectedIndex,"offY", parseInt(e.target.value))}
+                      className="w-full"
+                    />
+                    <div className="text-xs text-neutral-600 text-center mt-1">{selected.offY}%</div>
+                  </div>
+                </div>
+                <div className="mt-2">
+                  <button
+                    onClick={()=>updateField(selectedIndex,"scalePct",100) || updateField(selectedIndex,"offX",0) || updateField(selectedIndex,"offY",0)}
+                    className="px-3 py-2 border rounded-xl"
+                  >
+                    Reset immagine
+                  </button>
+                  <button onClick={()=>setPreviewOpen(true)} className="ml-2 px-3 py-2 border rounded-xl">Anteprima 1:1</button>
                 </div>
               </div>
             ) : (
-              <p className="text-sm text-neutral-500">Seleziona un'opera per modificarne i contenuti.</p>
+              <p className="text-sm text-neutral-500">Seleziona un'opera per modificarla.</p>
             )}
           </div>
         </section>
 
         <footer className="text-xs text-neutral-500 mt-6 space-y-1">
-          <p>Consigli: immagini JPG ad alta qualità. Senza bleed: margini ≥ 0.25" (consigliato 0.5"). Con bleed: pagina = trim + 0.125" (W) e +0.25" (H).</p>
+          <p>Consigli: immagini JPG ad alta qualità. Senza bleed: margini ≥ 0.25". Con bleed: pagina = trim + 0.125" (W) e +0.25" (H).</p>
         </footer>
       </div>
     </div>
