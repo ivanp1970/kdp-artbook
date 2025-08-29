@@ -3,6 +3,7 @@ import { jsPDF } from "jspdf";
 import * as pdfjsLib from "pdfjs-dist/build/pdf";
 import pdfWorker from "pdfjs-dist/build/pdf.worker.min?url";
 import JSZip from "jszip";
+import Tesseract from "tesseract.js";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 
@@ -25,7 +26,7 @@ function stripHtml(html) {
   return (doc.body?.textContent || "").replace(/\u00A0/g, " ");
 }
 
-// ————————— Pulizia (opzionale) —————————
+/* ---------------- Pulizia (opzionale) ---------------- */
 function autoRemoveHeadersFooters(pages) {
   if (!Array.isArray(pages) || pages.length < 3) return pages;
   const first = {}, last = {};
@@ -69,9 +70,50 @@ function tidy(text) {
     .replace(/\n{3,}/g, "\n\n");
 }
 
-// ————————— Component —————————
+/* ---------------- Diff semplice (word-level LCS) ---------------- */
+function diffWordsHTML(a, b) {
+  // tokenizza mantenendo spazi separati
+  const AT = a.split(/(\s+)/);
+  const BT = b.split(/(\s+)/);
+
+  // LCS dynamic programming
+  const n = AT.length, m = BT.length;
+  const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = AT[i] === BT[j] ? 1 + dp[i + 1][j + 1] : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  // ricostruzione
+  let i = 0, j = 0;
+  const out = [];
+  while (i < n && j < m) {
+    if (AT[i] === BT[j]) {
+      out.push(escapeHtml(AT[i]));
+      i++; j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      // rimozione
+      out.push(`<span class="bg-red-100 line-through">${escapeHtml(AT[i])}</span>`);
+      i++;
+    } else {
+      // inserimento
+      out.push(`<span class="bg-green-100">${escapeHtml(BT[j])}</span>`);
+      j++;
+    }
+  }
+  while (i < n) { out.push(`<span class="bg-red-100 line-through">${escapeHtml(AT[i++])}</span>`); }
+  while (j < m) { out.push(`<span class="bg-green-100">${escapeHtml(BT[j++])}</span>`); }
+  return out.join("");
+}
+function escapeHtml(s) {
+  return (s || "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+}
+
+/* ---------------- Component ---------------- */
 export default function TextBook() {
-  // Stato “originale”
+  /* Originale */
   const [originalType, setOriginalType] = useState(null); // "pdf" | "epub"
   // PDF
   const [pdfDoc, setPdfDoc] = useState(null);
@@ -80,30 +122,29 @@ export default function TextBook() {
   const [pdfScale, setPdfScale] = useState(1.25);
   const pdfCanvasRef = useRef(null);
   // EPUB
-  const [epubChapters, setEpubChapters] = useState([]); // [{path, htmlBlobUrl, textOnly}]
+  const [epubChapters, setEpubChapters] = useState([]); // [{path, htmlBlobUrl, textOnly, headings: [{level,text}]}]
   const [epubIndex, setEpubIndex] = useState(0);
 
-  // Testo “per pagina/capitolo” (estratto ma NON pulito)
-  const [rawUnits, setRawUnits] = useState([]); // array di stringhe: pagine PDF o capitoli EPUB
-  // Modifiche locali (senza pulizia)
-  const [edits, setEdits] = useState({}); // { "pdf:0": "testo", "epub:chap.xhtml": "testo" }
-
-  // Testo unito per l’impaginazione
+  /* Testo per unità (pagina/capitolo) – non pulito */
+  const [rawUnits, setRawUnits] = useState([]); // string[]
+  /* Modifiche locali */
+  const [edits, setEdits] = useState({}); // { "pdf:0": "text", "epub:path": "text" }
+  /* Body da impaginare */
   const [body, setBody] = useState("");
 
-  // Front/Back matter
+  /* Front/Back matter */
   const [title, setTitle] = useState("");
   const [author, setAuthor] = useState("");
   const [intro, setIntro] = useState("");
   const [bibliography, setBibliography] = useState("");
 
-  // Opzioni pulizia (per quando vuoi usarle)
+  /* Pulizia (opzionale) */
   const [autoHF, setAutoHF] = useState(true);
   const [stripPub, setStripPub] = useState(true);
   const [stripMarks, setStripMarks] = useState(true);
   const [stripNotes, setStripNotes] = useState(true);
 
-  // Layout
+  /* Layout */
   const [trimKey, setTrimKey] = useState("6x9");
   const [customW, setCustomW] = useState(6);
   const [customH, setCustomH] = useState(9);
@@ -114,12 +155,20 @@ export default function TextBook() {
   const [useSerif, setUseSerif] = useState(true);
   const [pageNumbers, setPageNumbers] = useState(true);
 
+  /* Diff */
+  const [showDiff, setShowDiff] = useState(true);
+
+  /* OCR */
+  const [ocrProgress, setOcrProgress] = useState(0);
+  const [ocrStatus, setOcrStatus] = useState(""); // messaggi
+  const [ocrRunning, setOcrRunning] = useState(false);
+
   const trim = useMemo(() => {
     const t = TRIMS.find((t) => t.key === trimKey) || TRIMS[0];
     return t.key === "custom" ? { ...t, w: customW, h: customH } : t;
   }, [trimKey, customW, customH]);
 
-  // -------------- Import file --------------
+  /* -------------- Import file -------------- */
   async function onOpenFile(e) {
     const f = e.target.files?.[0];
     if (!f) return;
@@ -140,15 +189,14 @@ export default function TextBook() {
       alert("Errore lettura file: " + (err?.message || ""));
     }
   }
-
   function resetAll() {
     setPdfDoc(null); setPdfNumPages(0); setPdfPageIndex(0);
     setEpubChapters([]); setEpubIndex(0);
     setRawUnits([]); setEdits({});
-    setBody("");
+    setBody(""); setOcrProgress(0); setOcrStatus(""); setOcrRunning(false);
   }
 
-  // PDF: carica + estrai testo pagine
+  /* -------------- PDF: carica + estrai testo -------------- */
   async function loadPdf(file) {
     const buf = await file.arrayBuffer();
     const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
@@ -162,27 +210,25 @@ export default function TextBook() {
       const text = c.items.map((it) => it.str).join(" ");
       pages.push(text);
     }
-    setRawUnits(pages); // una entry per pagina
-    setBody(pages.join("\n\n")); // default: testo unito (non pulito)
+    setRawUnits(pages);
+    setBody(pages.join("\n\n"));
   }
 
-  // EPUB: carica + crea capitoli HTML (con immagini) + testo-only per editing
+  /* -------------- EPUB: CSS inline + risorse + TOC -------------- */
   async function loadEpub(file) {
     const ab = await file.arrayBuffer();
     const zip = await JSZip.loadAsync(ab);
     const paths = Object.keys(zip.files).filter((p) => /\.(xhtml|html|htm)$/i.test(p)).sort();
 
-    // crea mapping risorse → Blob URL
     const resourceUrl = {};
     async function getResourceUrl(relPath, basePath) {
-      // risolve percorso relativo
       let full = relPath;
       if (!/^https?:/i.test(relPath)) {
         const baseDir = basePath.split("/").slice(0, -1).join("/");
         full = (baseDir ? baseDir + "/" : "") + relPath;
       }
       const f = zip.file(full);
-      if (!f) return relPath; // fallback
+      if (!f) return relPath; // esterno
       if (resourceUrl[full]) return resourceUrl[full];
 
       const ext = full.split(".").pop().toLowerCase();
@@ -199,32 +245,62 @@ export default function TextBook() {
       return url;
     }
 
+    async function inlineCss(cssText, basePath) {
+      // rimpiazza url(...) nel CSS con Blob URL locali
+      const re = /url\((['"]?)([^'")]+)\1\)/g;
+      const parts = [];
+      let last = 0;
+      for (let m; (m = re.exec(cssText)); ) {
+        parts.push(cssText.slice(last, m.index));
+        const asset = m[2];
+        // eslint-disable-next-line no-await-in-loop
+        const url = await getResourceUrl(asset, basePath);
+        parts.push(`url('${url}')`);
+        last = re.lastIndex;
+      }
+      parts.push(cssText.slice(last));
+      return parts.join("");
+    }
+
     const chapters = [];
     for (const p of paths) {
       const html = await zip.file(p).async("string");
       const doc = new DOMParser().parseFromString(html, "text/html");
 
-      // risolvi immagini locali
+      // IMMAGINI
       const imgs = Array.from(doc.querySelectorAll("img[src]"));
-      // risolvi css link (opzionale)
-      const links = Array.from(doc.querySelectorAll("link[rel=stylesheet][href]"));
-
-      // eslint-disable-next-line no-await-in-loop
       for (const img of imgs) {
         const src = img.getAttribute("src");
         // eslint-disable-next-line no-await-in-loop
         const url = await getResourceUrl(src, p);
         img.setAttribute("src", url);
       }
+
+      // CSS → inline style
+      const links = Array.from(doc.querySelectorAll("link[rel=stylesheet][href]"));
       for (const link of links) {
         const href = link.getAttribute("href");
-        const url = await getResourceUrl(href, p);
-        // sostituisco il <link> con <style>@import url(...) per semplicità
-        const style = doc.createElement("style");
-        style.textContent = `@import url('${url}');`;
-        link.parentNode.replaceChild(style, link);
+        const f = p.split("/").slice(0, -1).join("/");
+        const basePath = (f ? f + "/" : "") + href;
+        const cssFile = zip.file(basePath);
+        if (cssFile) {
+          // eslint-disable-next-line no-await-in-loop
+          let cssText = await cssFile.async("string");
+          // eslint-disable-next-line no-await-in-loop
+          cssText = await inlineCss(cssText, basePath);
+          const style = doc.createElement("style");
+          style.textContent = cssText;
+          link.parentNode.replaceChild(style, link);
+        }
       }
 
+      // Crea TOC dal documento: H1-H3
+      const headings = Array.from(doc.querySelectorAll("h1, h2, h3")).map((h) => ({
+        level: h.tagName.toLowerCase(),
+        text: (h.textContent || "").trim().replace(/\s+/g, " "),
+      }));
+
+      // Blob URL per anteprima
       const htmlString = "<!doctype html>" + (doc.documentElement?.outerHTML || "");
       const blob = new Blob([htmlString], { type: "text/html" });
       const htmlBlobUrl = URL.createObjectURL(blob);
@@ -233,6 +309,7 @@ export default function TextBook() {
         path: p,
         htmlBlobUrl,
         textOnly: stripHtml(html),
+        headings,
       });
     }
 
@@ -241,7 +318,7 @@ export default function TextBook() {
     setBody(chapters.map((c) => c.textOnly).join("\n\n"));
   }
 
-  // -------------- Rendering anteprima PDF --------------
+  /* -------------- Anteprima PDF (render canvas) -------------- */
   useEffect(() => {
     if (originalType !== "pdf" || !pdfDoc) return;
     let cancelled = false;
@@ -255,7 +332,6 @@ export default function TextBook() {
         const ctx = canvas.getContext("2d");
         canvas.width = viewport.width;
         canvas.height = viewport.height;
-
         const renderContext = { canvasContext: ctx, viewport };
         const task = page.render(renderContext);
         await task.promise;
@@ -267,7 +343,7 @@ export default function TextBook() {
     return () => { cancelled = true; };
   }, [originalType, pdfDoc, pdfPageIndex, pdfScale]);
 
-  // -------------- Editor selezione corrente --------------
+  /* -------------- Editor selezione corrente -------------- */
   const currentKey =
     originalType === "pdf" ? `pdf:${pdfPageIndex}` :
     originalType === "epub" ? `epub:${epubChapters[epubIndex]?.path || ""}` : "";
@@ -277,13 +353,14 @@ export default function TextBook() {
     originalType === "epub" ? (epubChapters[epubIndex]?.textOnly || "") : "";
 
   const currentEditedText = edits[currentKey] ?? currentOriginalText;
+
   function saveCurrentEdit() {
     if (!currentKey) return;
     setEdits((prev) => ({ ...prev, [currentKey]: currentEditedText }));
-    alert("Modifica salvata per la selezione corrente.");
+    alert("Modifica salvata per l’elemento corrente.");
   }
 
-  // Trova/Sostituisci sul selezionato
+  /* Trova/Sostituisci */
   const [findText, setFindText] = useState("");
   const [replaceText, setReplaceText] = useState("");
   function applyReplace() {
@@ -295,7 +372,7 @@ export default function TextBook() {
     setEdits((prev) => ({ ...prev, [currentKey]: replaced }));
   }
 
-  // Costruisci BODY dalle modifiche (senza pulizia)
+  /* BODY da modifiche (senza pulizia) */
   function buildBodyFromEdits() {
     if (originalType === "pdf") {
       const arr = rawUnits.map((txt, i) => edits[`pdf:${i}`] ?? txt);
@@ -308,7 +385,73 @@ export default function TextBook() {
     }
   }
 
-  // —————— Pulizia automatica (opzionale) ——————
+  /* -------------- OCR (PDF) -------------- */
+  async function ocrCurrentPage() {
+    if (originalType !== "pdf" || !pdfDoc) return;
+    setOcrRunning(true);
+    setOcrProgress(0);
+    setOcrStatus("Render pagina…");
+    try {
+      const page = await pdfDoc.getPage(pdfPageIndex + 1);
+      const scale = 2.0; // OCR migliore
+      const viewport = page.getViewport({ scale });
+      // offscreen canvas
+      const cnv = document.createElement("canvas");
+      cnv.width = viewport.width;
+      cnv.height = viewport.height;
+      const ctx = cnv.getContext("2d");
+      await page.render({ canvasContext: ctx, viewport }).promise;
+
+      setOcrStatus("OCR in corso… (ita+eng)");
+      const { data } = await Tesseract.recognize(cnv, "ita+eng", {
+        logger: (m) => setOcrProgress(m.progress || 0),
+      });
+      const text = tidy(data?.text || "");
+      setEdits((prev) => ({ ...prev, [currentKey]: text }));
+      setOcrStatus("Fatto.");
+    } catch (e) {
+      console.error(e);
+      setOcrStatus("Errore OCR: " + (e?.message || ""));
+    } finally {
+      setOcrRunning(false);
+    }
+  }
+
+  async function ocrAllPages() {
+    if (originalType !== "pdf" || !pdfDoc) return;
+    if (!confirm("Eseguo OCR su TUTTE le pagine? Può richiedere tempo.")) return;
+    setOcrRunning(true);
+    try {
+      for (let idx = 0; idx < pdfNumPages; idx++) {
+        setOcrStatus(`Pagina ${idx + 1}/${pdfNumPages} – render…`);
+        const page = await pdfDoc.getPage(idx + 1);
+        const scale = 2.0;
+        const viewport = page.getViewport({ scale });
+        const cnv = document.createElement("canvas");
+        cnv.width = viewport.width;
+        cnv.height = viewport.height;
+        const ctx = cnv.getContext("2d");
+        await page.render({ canvasContext: ctx, viewport }).promise;
+
+        setOcrStatus(`Pagina ${idx + 1}/${pdfNumPages} – OCR…`);
+        setOcrProgress(0);
+        const { data } = await Tesseract.recognize(cnv, "ita+eng", {
+          logger: (m) => setOcrProgress(m.progress || 0),
+        });
+        const text = tidy(data?.text || "");
+        const key = `pdf:${idx}`;
+        setEdits((prev) => ({ ...prev, [key]: text }));
+      }
+      setOcrStatus("OCR completo.");
+    } catch (e) {
+      console.error(e);
+      setOcrStatus("Errore OCR: " + (e?.message || ""));
+    } finally {
+      setOcrRunning(false);
+    }
+  }
+
+  /* -------------- Pulizia automatica (opzionale) -------------- */
   function runCleanup() {
     let pages = rawUnits && rawUnits.length ? rawUnits.slice() : (body ? body.split(/\n{2,}/) : []);
     if (!pages.length) {
@@ -324,7 +467,7 @@ export default function TextBook() {
     setBody(t);
   }
 
-  // —————— Impaginazione PDF finale ——————
+  /* -------------- Impaginazione PDF finale -------------- */
   function exportPdf() {
     const { w: pageW, h: pageH } = calcBleedSize(trim.w, trim.h, bleed);
     const doc = new jsPDF({ unit: "in", format: [pageW, pageH], orientation: "portrait" });
@@ -403,70 +546,135 @@ export default function TextBook() {
     doc.text(String(pageNum), pageW / 2, pageH - 0.4, { align: "center" });
   }
 
-  // —————— UI ——————
+  /* -------------- UI -------------- */
+  const toc = useMemo(() => {
+    if (originalType !== "epub") return [];
+    const out = [];
+    epubChapters.forEach((c, idx) => {
+      (c.headings || []).forEach((h) => {
+        out.push({ chapterIndex: idx, level: h.level, text: h.text });
+      });
+    });
+    return out;
+  }, [originalType, epubChapters]);
+
+  const diffHTML = useMemo(() => {
+    if (!showDiff) return "";
+    return diffWordsHTML(currentOriginalText, currentEditedText);
+  }, [showDiff, currentOriginalText, currentEditedText]);
+
   return (
     <div className="p-4 space-y-4">
       <header className="flex flex-wrap items-end gap-3">
         <div>
           <h2 className="text-xl font-bold">Libro di Testo – PDF/EPUB</h2>
           <p className="text-sm text-neutral-600">
-            Anteprima originale (copertina, note, immagini). Modifica mirata senza pulizia. Poi impagina KDP.
+            Anteprima originale completa; modifica mirata senza pulizia; Diff, OCR (PDF), CSS inline & Indice (EPUB); esporta PDF KDP.
           </p>
         </div>
         <div className="ml-auto flex items-center gap-2">
           <input type="file" accept=".pdf,.epub" onChange={onOpenFile} className="hidden" id="textbook-file" />
           <label htmlFor="textbook-file" className="px-3 py-2 rounded-xl border shadow-sm cursor-pointer">Carica PDF/EPUB</label>
+
+          {originalType === "pdf" && (
+            <>
+              <button className="px-3 py-2 rounded-xl border shadow-sm" onClick={ocrCurrentPage} disabled={ocrRunning}>
+                OCR pagina
+              </button>
+              <button className="px-3 py-2 rounded-xl border shadow-sm" onClick={ocrAllPages} disabled={ocrRunning}>
+                OCR tutto (lento)
+              </button>
+            </>
+          )}
+
           <button className="px-3 py-2 rounded-xl border shadow-sm" onClick={buildBodyFromEdits}>Crea testo modificato (senza pulizia)</button>
           <button className="px-3 py-2 rounded-xl border shadow-sm" onClick={runCleanup}>Pulisci</button>
           <button className="px-4 py-2 rounded-2xl shadow bg-black text-white" onClick={exportPdf}>Esporta PDF</button>
         </div>
       </header>
 
+      {/* Stato OCR */}
+      {ocrRunning && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 flex items-center gap-3">
+          <div className="flex-1">
+            <div className="h-2 bg-amber-100 rounded">
+              <div className="h-2 bg-amber-400 rounded" style={{ width: `${Math.round(ocrProgress * 100)}%` }} />
+            </div>
+            <p className="text-xs mt-1 text-amber-800">{ocrStatus} — {Math.round(ocrProgress * 100)}%</p>
+          </div>
+        </div>
+      )}
+
       {/* 1) ANTEPRIMA ORIGINALE */}
-      <section className="bg-white rounded-2xl shadow p-4">
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="font-semibold">Anteprima originale</h3>
+      <section className="grid grid-cols-1 lg:grid-cols-4 gap-4">
+        {/* TOC per EPUB */}
+        <aside className="lg:col-span-1 bg-white rounded-2xl shadow p-4 h-[70vh] overflow-auto">
+          <h3 className="font-semibold mb-2">Indice (EPUB)</h3>
+          {originalType === "epub" && toc.length > 0 ? (
+            <ul className="space-y-1 text-sm">
+              {toc.map((e, i) => (
+                <li key={i}>
+                  <button
+                    className="text-left w-full hover:underline"
+                    style={{ paddingLeft: e.level === "h1" ? 0 : e.level === "h2" ? 12 : 24 }}
+                    onClick={() => setEpubIndex(e.chapterIndex)}
+                  >
+                    {e.text}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-xs text-neutral-500">Carica un EPUB per vedere l’indice.</p>
+          )}
+        </aside>
+
+        {/* Preview */}
+        <div className="lg:col-span-3 bg-white rounded-2xl shadow p-4">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="font-semibold">Anteprima originale</h3>
+            {originalType === "pdf" && (
+              <div className="flex items-center gap-2 text-sm">
+                <button className="px-2 py-1 border rounded" onClick={()=>setPdfPageIndex(Math.max(0, pdfPageIndex-1))}>◀</button>
+                <span>Pagina {pdfPageIndex+1} / {pdfNumPages || 0}</span>
+                <button className="px-2 py-1 border rounded" onClick={()=>setPdfPageIndex(Math.min(pdfNumPages-1, pdfPageIndex+1))}>▶</button>
+                <span className="ml-4">Zoom</span>
+                <input type="range" min="0.6" max="2" step="0.05" value={pdfScale} onChange={(e)=>setPdfScale(parseFloat(e.target.value)||1.25)} />
+                <span className="w-10 text-right">{Math.round(pdfScale*100)}%</span>
+              </div>
+            )}
+            {originalType === "epub" && (
+              <div className="flex items-center gap-2 text-sm">
+                <button className="px-2 py-1 border rounded" onClick={()=>setEpubIndex(Math.max(0, epubIndex-1))}>◀</button>
+                <span>Capitolo {epubIndex+1} / {epubChapters.length || 0}</span>
+                <button className="px-2 py-1 border rounded" onClick={()=>setEpubIndex(Math.min(epubChapters.length-1, epubIndex+1))}>▶</button>
+              </div>
+            )}
+          </div>
+
           {originalType === "pdf" && (
-            <div className="flex items-center gap-2 text-sm">
-              <button className="px-2 py-1 border rounded" onClick={()=>setPdfPageIndex(Math.max(0, pdfPageIndex-1))}>◀</button>
-              <span>Pagina {pdfPageIndex+1} / {pdfNumPages || 0}</span>
-              <button className="px-2 py-1 border rounded" onClick={()=>setPdfPageIndex(Math.min(pdfNumPages-1, pdfPageIndex+1))}>▶</button>
-              <span className="ml-4">Zoom</span>
-              <input type="range" min="0.6" max="2" step="0.05" value={pdfScale} onChange={(e)=>setPdfScale(parseFloat(e.target.value)||1.25)} />
-              <span className="w-10 text-right">{Math.round(pdfScale*100)}%</span>
+            <div className="w-full overflow-auto border rounded-xl p-2">
+              <canvas ref={pdfCanvasRef} className="block mx-auto" />
             </div>
           )}
-          {originalType === "epub" && (
-            <div className="flex items-center gap-2 text-sm">
-              <button className="px-2 py-1 border rounded" onClick={()=>setEpubIndex(Math.max(0, epubIndex-1))}>◀</button>
-              <span>Capitolo {epubIndex+1} / {epubChapters.length || 0}</span>
-              <button className="px-2 py-1 border rounded" onClick={()=>setEpubIndex(Math.min(epubChapters.length-1, epubIndex+1))}>▶</button>
+
+          {originalType === "epub" && epubChapters[epubIndex] && (
+            <div className="w-full overflow-auto border rounded-xl p-2 h-[70vh]">
+              <iframe
+                title="EPUB preview"
+                src={epubChapters[epubIndex].htmlBlobUrl}
+                className="w-full h-full rounded"
+              />
             </div>
+          )}
+
+          {!originalType && (
+            <p className="text-sm text-neutral-500">Carica un PDF o un EPUB per vedere l’anteprima completa (copertina, note, immagini).</p>
           )}
         </div>
-
-        {originalType === "pdf" && (
-          <div className="w-full overflow-auto border rounded-xl p-2">
-            <canvas ref={pdfCanvasRef} className="block mx-auto" />
-          </div>
-        )}
-
-        {originalType === "epub" && epubChapters[epubIndex] && (
-          <div className="w-full overflow-auto border rounded-xl p-2 h-[70vh]">
-            <iframe
-              title="EPUB preview"
-              src={epubChapters[epubIndex].htmlBlobUrl}
-              className="w-full h-full rounded"
-            />
-          </div>
-        )}
-
-        {!originalType && (
-          <p className="text-sm text-neutral-500">Carica un PDF o un EPUB per vedere l’anteprima completa (copertina, note, immagini).</p>
-        )}
       </section>
 
-      {/* 2) EDITOR PAGINA/CAPITOLO SELEZIONATO (senza pulizia) */}
+      {/* 2) EDITOR + DIFF */}
       <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div className="bg-white rounded-2xl shadow p-4">
           <h3 className="font-semibold mb-2">Editor (elemento selezionato)</h3>
@@ -494,14 +702,35 @@ export default function TextBook() {
             </div>
             <button className="px-3 py-2 border rounded-xl" onClick={applyReplace}>Sostituisci (solo selezionato)</button>
             <button className="px-3 py-2 border rounded-xl" onClick={saveCurrentEdit}>Salva modifica</button>
+            <label className="inline-flex items-center gap-2 text-sm ml-auto">
+              <input type="checkbox" checked={showDiff} onChange={(e)=>setShowDiff(e.target.checked)} />
+              Mostra diff
+            </label>
           </div>
         </div>
 
-        {/* 3) Testo complessivo risultante */}
+        <div className="bg-white rounded-2xl shadow p-4">
+          <h3 className="font-semibold mb-2">Diff (originale vs modificato)</h3>
+          {showDiff ? (
+            <div
+              className="prose max-w-none text-sm p-3 border rounded-xl overflow-auto h-[40vh] whitespace-pre-wrap"
+              dangerouslySetInnerHTML={{ __html: diffHTML }}
+            />
+          ) : (
+            <p className="text-xs text-neutral-500">Attiva “Mostra diff” per evidenziare le modifiche.</p>
+          )}
+          <p className="text-xs text-neutral-500 mt-2">
+            Verde = aggiunte; Rosso barrato = rimosse. Il diff è per l’elemento selezionato (pagina/capitolo).
+          </p>
+        </div>
+      </section>
+
+      {/* 3) Body risultante */}
+      <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div className="bg-white rounded-2xl shadow p-4">
           <h3 className="font-semibold mb-2">Anteprima testo risultante</h3>
           <p className="text-xs text-neutral-600 mb-2">
-            Questo è il testo su cui verrà fatta l’impaginazione. Puoi generarlo “senza pulizia” (da modifiche) o usare “Pulisci”.
+            Questo è il testo su cui verrà fatta l’impaginazione. Genera da “Crea testo modificato (senza pulizia)” o usa “Pulisci”.
           </p>
           <textarea
             value={body}
@@ -509,11 +738,8 @@ export default function TextBook() {
             className="w-full h-[40vh] border rounded-xl px-3 py-2 whitespace-pre-wrap"
           />
         </div>
-      </section>
 
-      {/* 4) Impaginazione */}
-      <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* layout */}
+        {/* Impaginazione */}
         <div className="bg-white rounded-2xl shadow p-4">
           <h3 className="font-semibold mb-2">Impaginazione</h3>
           <label className="block text-sm mb-1">Trim size</label>
@@ -541,28 +767,18 @@ export default function TextBook() {
             <div><label className="block text-xs mb-1">Interlinea</label><input type="number" min="1" step="0.05" value={lineHeight} onChange={(e)=>setLineHeight(parseFloat(e.target.value)||lineHeight)} className="w-full border rounded-xl px-3 py-2"/></div>
           </div>
           <label className="block text-sm mt-2"><input type="checkbox" className="mr-2" checked={pageNumbers} onChange={(e)=>setPageNumbers(e.target.checked)} /> Numeri di pagina</label>
-        </div>
 
-        {/* front/back matter */}
-        <div className="bg-white rounded-2xl shadow p-4">
-          <h3 className="font-semibold mb-2">Front/Back matter</h3>
-          <label className="block text-sm mb-1">Titolo</label>
-          <input value={title} onChange={(e)=>setTitle(e.target.value)} className="w-full border rounded-xl px-3 py-2 mb-2"/>
-          <label className="block text-sm mb-1">Autore/Editore</label>
-          <input value={author} onChange={(e)=>setAuthor(e.target.value)} className="w-full border rounded-xl px-3 py-2 mb-2"/>
-          <label className="block text-sm mb-1">Introduzione</label>
-          <textarea value={intro} onChange={(e)=>setIntro(e.target.value)} className="w-full h-24 border rounded-xl px-3 py-2 mb-2"/>
-          <label className="block text-sm mb-1">Appendici / Bibliografia</label>
-          <textarea value={bibliography} onChange={(e)=>setBibliography(e.target.value)} className="w-full h-24 border rounded-xl px-3 py-2"/>
-        </div>
-
-        {/* pulizia opzion. */}
-        <div className="bg-white rounded-2xl shadow p-4">
-          <h3 className="font-semibold mb-2">Pulizia automatica (opzionale)</h3>
-          <label className="block text-sm mb-1"><input type="checkbox" className="mr-2" checked={autoHF} onChange={(e)=>setAutoHF(e.target.checked)} /> Rimuovi header/footer ripetitivi (solo PDF)</label>
-          <label className="block text-sm mb-1"><input type="checkbox" className="mr-2" checked={stripPub} onChange={(e)=>setStripPub(e.target.checked)} /> Rimuovi righe editore (©, ISBN, ecc.)</label>
-          <label className="block text-sm mb-1"><input type="checkbox" className="mr-2" checked={stripMarks} onChange={(e)=>setStripMarks(e.target.checked)} /> Rimuovi marcatori nota ([1], (1), ^1)</label>
-          <label className="block text-sm"><input type="checkbox" className="mr-2" checked={stripNotes} onChange={(e)=>setStripNotes(e.target.checked)} /> Rimuovi blocchi “NOTE/APPARATI”</label>
+          <div className="mt-4">
+            <h4 className="font-semibold mb-2">Front/Back matter</h4>
+            <label className="block text-sm mb-1">Titolo</label>
+            <input value={title} onChange={(e)=>setTitle(e.target.value)} className="w-full border rounded-xl px-3 py-2 mb-2"/>
+            <label className="block text-sm mb-1">Autore/Editore</label>
+            <input value={author} onChange={(e)=>setAuthor(e.target.value)} className="w-full border rounded-xl px-3 py-2 mb-2"/>
+            <label className="block text-sm mb-1">Introduzione</label>
+            <textarea value={intro} onChange={(e)=>setIntro(e.target.value)} className="w-full h-20 border rounded-xl px-3 py-2 mb-2"/>
+            <label className="block text-sm mb-1">Appendici / Bibliografia</label>
+            <textarea value={bibliography} onChange={(e)=>setBibliography(e.target.value)} className="w-full h-20 border rounded-xl px-3 py-2"/>
+          </div>
         </div>
       </section>
     </div>
