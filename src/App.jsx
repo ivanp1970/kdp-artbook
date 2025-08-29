@@ -1,15 +1,17 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { jsPDF } from "jspdf";
-import TextBook from "./TextBook"; // ⬅️ nuova sezione PDF/EPUB
+import TextBook from "./TextBook";       // ⬅️ sezione PDF/EPUB (libro di testo)
+import CoverDesigner from "./CoverDesigner"; // ⬅️ sezione Copertina KDP
 
 /**
  * KDP ArtBook Builder – App.jsx (completo)
  * - Import immagini (JPG/PNG) con DPI check
- * - Sinistra immagine / Destra testo
+ * - Doppia pagina: sinistra immagine / destra testo
+ * - Anteprima con zoom
  * - KDP Checker (pagine minime, margini, DPI)
  * - Esporta PDF (jsPDF, unità in pollici)
  * - AI (OpenAI) lato client
- * - Mini-router: /#text apre la sezione “Libro di Testo (PDF/EPUB)”
+ * - Mini-router: /#text (libro di testo), /#cover (copertina)
  */
 
 const TRIMS = [
@@ -29,25 +31,27 @@ function pxNeeded(widthIn, heightIn, dpi = 300) {
   return { w: Math.round(widthIn * dpi), h: Math.round(heightIn * dpi) };
 }
 function calcBleedSize(trimW, trimH, bleed) {
-  // KDP: con bleed aggiungi 0.125" in larghezza e 0.25" in altezza
+  // KDP: con bleed aggiungi 0.125" W e 0.25" H complessivi
   return bleed ? { w: trimW + 0.125, h: trimH + 0.25 } : { w: trimW, h: trimH };
 }
 
 export default function App() {
-  // --- mini-router per la sezione testo ---
+  // --- mini-router hash ---
   const [hash, setHash] = useState(typeof window !== "undefined" ? window.location.hash : "");
   useEffect(() => {
     const onH = () => setHash(window.location.hash);
     window.addEventListener("hashchange", onH);
     return () => window.removeEventListener("hashchange", onH);
   }, []);
-  if (hash === "#text") return <TextBook />; // ⬅️ apre la sezione PDF/EPUB
+  if (hash === "#text") return <TextBook />;
+  if (hash === "#cover") return <CoverDesigner />;
 
   const fileInputRef = useRef(null);
 
   // immagini/opere
   const [items, setItems] = useState([]); // { id, name, src, width, height, title, description, warnings[] }
   const [selectedIndex, setSelectedIndex] = useState(0);
+  const selected = items[selectedIndex] || null;
 
   // libro
   const [bookTitle, setBookTitle] = useState("Caravaggio – Opere");
@@ -63,6 +67,9 @@ export default function App() {
   const [fontSize, setFontSize] = useState(11);
   const [lineHeight, setLineHeight] = useState(1.35);
   const [useSerif, setUseSerif] = useState(true);
+
+  // anteprima
+  const [previewZoom, setPreviewZoom] = useState(1.0); // 0.5 - 2.0
 
   // AI (client)
   const [apiKey, setApiKey] = useState("");
@@ -142,7 +149,8 @@ export default function App() {
     setItems((prev) => {
       const copy = [...prev];
       copy.splice(index, 1);
-      setSelectedIndex((s) => Math.max(0, Math.min(s, copy.length - 1)));
+      const nextIdx = Math.max(0, Math.min(selectedIndex, copy.length - 1));
+      setSelectedIndex(nextIdx);
       return copy;
     });
   }
@@ -304,18 +312,20 @@ export default function App() {
     alert(issues.length ? `Problemi:\n- ${issues.join("\n- ")}` : "Nessun problema critico.");
   }
 
-  const selected = items[selectedIndex];
-
   return (
     <div className={`min-h-screen ${fontClass} bg-neutral-50`}>
       <div className="max-w-7xl mx-auto p-6">
+        {/* Header */}
         <header className="mb-6 flex items-center justify-between gap-4">
           <div>
             <h1 className="text-2xl font-bold">KDP ArtBook Builder – Caravaggio</h1>
-            <p className="text-sm text-neutral-600">Doppia pagina: sinistra immagine, destra testo • PDF pronto KDP</p>
+            <p className="text-sm text-neutral-600">
+              Doppia pagina: sinistra immagine, destra testo • PDF pronto KDP
+            </p>
           </div>
           <div className="flex gap-2">
             <a href="#text" className="px-3 py-2 rounded-2xl border shadow-sm">Libro di Testo (PDF/EPUB)</a>
+            <a href="#cover" className="px-3 py-2 rounded-2xl border shadow-sm">Copertina (KDP)</a>
             <button onClick={kdpCheck} className="px-3 py-2 rounded-2xl border shadow-sm">KDP Checker</button>
             <button onClick={exportToPdf} className="px-4 py-2 rounded-2xl shadow bg-black text-white hover:opacity-90">Esporta PDF</button>
           </div>
@@ -385,10 +395,20 @@ export default function App() {
               <h3 className="font-semibold">Opere ({items.length})</h3>
               <div className="text-xs text-neutral-500">Target: 300 DPI</div>
             </div>
-            <div className="border-2 border-dashed rounded-2xl p-4 text-center cursor-pointer hover:bg-neutral-50 mb-3" onClick={()=>fileInputRef.current?.click()}>
+            <div
+              className="border-2 border-dashed rounded-2xl p-4 text-center cursor-pointer hover:bg-neutral-50 mb-3"
+              onClick={()=>fileInputRef.current?.click()}
+            >
               <p className="text-sm">Trascina qui le immagini o clicca per selezionare</p>
               <p className="text-xs text-neutral-500 mt-1">JPG/PNG ad alta risoluzione consigliati</p>
-              <input ref={fileInputRef} type="file" accept="image/*" multiple className="hidden" onChange={(e)=>onFilesSelected(e.target.files)} />
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                multiple
+                className="hidden"
+                onChange={(e)=>onFilesSelected(e.target.files)}
+              />
             </div>
             {items.length === 0 && <p className="text-sm text-neutral-500">Nessuna immagine.</p>}
             <ul className="space-y-2">
@@ -414,18 +434,42 @@ export default function App() {
             </ul>
           </div>
 
-          {/* anteprima */}
+          {/* anteprima con zoom */}
           <div className="bg-white rounded-2xl shadow p-4 h-[70vh] overflow-auto">
-            <h3 className="font-semibold mb-3">Anteprima doppia pagina</h3>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="font-semibold">Anteprima doppia pagina</h3>
+              <div className="flex items-center gap-2 text-sm">
+                <span>Zoom</span>
+                <input
+                  type="range" min="0.5" max="2" step="0.05"
+                  value={previewZoom}
+                  onChange={(e)=>setPreviewZoom(parseFloat(e.target.value)||1)}
+                />
+                <span className="w-10 text-right">{Math.round(previewZoom*100)}%</span>
+              </div>
+            </div>
+
             {selected ? (
-              <div className="grid grid-cols-2 gap-4">
-                <div className="aspect-[2/3] border rounded-xl flex items-center justify-center overflow-hidden bg-neutral-100">
-                  <img src={selected.src} alt={selected.name} className="object-contain max-h-full max-w-full" />
-                </div>
-                <div className="aspect-[2/3] border rounded-xl p-3 overflow-auto">
-                  <h4 className="font-semibold mb-2 break-words">{selected.title || selected.name}</h4>
-                  <div className="max-w-none whitespace-pre-wrap text-sm leading-relaxed">
-                    {selected.description || <span className="text-neutral-400">(Nessun testo)</span>}
+              <div className="flex justify-center">
+                <div
+                  style={{ transform: `scale(${previewZoom})`, transformOrigin: "top center" }}
+                  className="transition-transform"
+                >
+                  <div className="grid grid-cols-2 gap-4">
+                    {/* sinistra */}
+                    <div className="aspect-[2/3] w-[280px] border rounded-xl flex items-center justify-center overflow-hidden bg-neutral-100">
+                      <img src={selected.src} alt={selected.name} className="object-contain max-h-full max-w-full" />
+                    </div>
+                    {/* destra */}
+                    <div className="aspect-[2/3] w-[280px] border rounded-xl p-3 overflow-auto">
+                      <h4 className="font-semibold mb-2 break-words">{selected.title || selected.name}</h4>
+                      <div
+                        className="max-w-none whitespace-pre-wrap text-sm leading-relaxed"
+                        style={{ fontFamily: useSerif ? "serif" : "system-ui", fontSize: `${fontSize}px`, lineHeight }}
+                      >
+                        {selected.description || <span className="text-neutral-400">(Nessun testo)</span>}
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>
