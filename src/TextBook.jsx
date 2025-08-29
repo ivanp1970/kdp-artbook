@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { jsPDF } from "jspdf";
 import * as pdfjsLib from "pdfjs-dist/build/pdf";
 import pdfWorker from "pdfjs-dist/build/pdf.worker.min?url";
@@ -25,7 +25,7 @@ function stripHtml(html) {
   return (doc.body?.textContent || "").replace(/\u00A0/g, " ");
 }
 
-// Heuristica: rimuove header/footer ripetitivi tra pagine
+// ————————— Pulizia (opzionale) —————————
 function autoRemoveHeadersFooters(pages) {
   if (!Array.isArray(pages) || pages.length < 3) return pages;
   const first = {}, last = {};
@@ -69,23 +69,41 @@ function tidy(text) {
     .replace(/\n{3,}/g, "\n\n");
 }
 
+// ————————— Component —————————
 export default function TextBook() {
-  const [rawPages, setRawPages] = useState([]); // testo per pagina post-estrazione
-  const [body, setBody] = useState(""); // testo unito e pulito
+  // Stato “originale”
+  const [originalType, setOriginalType] = useState(null); // "pdf" | "epub"
+  // PDF
+  const [pdfDoc, setPdfDoc] = useState(null);
+  const [pdfNumPages, setPdfNumPages] = useState(0);
+  const [pdfPageIndex, setPdfPageIndex] = useState(0);
+  const [pdfScale, setPdfScale] = useState(1.25);
+  const pdfCanvasRef = useRef(null);
+  // EPUB
+  const [epubChapters, setEpubChapters] = useState([]); // [{path, htmlBlobUrl, textOnly}]
+  const [epubIndex, setEpubIndex] = useState(0);
 
-  // front/back matter
+  // Testo “per pagina/capitolo” (estratto ma NON pulito)
+  const [rawUnits, setRawUnits] = useState([]); // array di stringhe: pagine PDF o capitoli EPUB
+  // Modifiche locali (senza pulizia)
+  const [edits, setEdits] = useState({}); // { "pdf:0": "testo", "epub:chap.xhtml": "testo" }
+
+  // Testo unito per l’impaginazione
+  const [body, setBody] = useState("");
+
+  // Front/Back matter
   const [title, setTitle] = useState("");
   const [author, setAuthor] = useState("");
   const [intro, setIntro] = useState("");
   const [bibliography, setBibliography] = useState("");
 
-  // opzioni pulizia
+  // Opzioni pulizia (per quando vuoi usarle)
   const [autoHF, setAutoHF] = useState(true);
   const [stripPub, setStripPub] = useState(true);
   const [stripMarks, setStripMarks] = useState(true);
   const [stripNotes, setStripNotes] = useState(true);
 
-  // layout
+  // Layout
   const [trimKey, setTrimKey] = useState("6x9");
   const [customW, setCustomW] = useState(6);
   const [customH, setCustomH] = useState(9);
@@ -101,61 +119,203 @@ export default function TextBook() {
     return t.key === "custom" ? { ...t, w: customW, h: customH } : t;
   }, [trimKey, customW, customH]);
 
-  // Import file
+  // -------------- Import file --------------
   async function onOpenFile(e) {
     const f = e.target.files?.[0];
     if (!f) return;
     const name = (f.name || "").toLowerCase();
+    resetAll();
     try {
       if (name.endsWith(".pdf")) {
-        const pages = await extractPdfText(f);
-        setRawPages(pages);
-        setBody(pages.join("\n\n"));
+        setOriginalType("pdf");
+        await loadPdf(f);
       } else if (name.endsWith(".epub")) {
-        const text = await extractEpubText(f);
-        setRawPages(text.split(/\n{2,}/));
-        setBody(text);
+        setOriginalType("epub");
+        await loadEpub(f);
       } else {
         alert("Formato non supportato. Carica un PDF o un EPUB.");
       }
     } catch (err) {
+      console.error(err);
       alert("Errore lettura file: " + (err?.message || ""));
     }
   }
 
-  async function extractPdfText(file) {
+  function resetAll() {
+    setPdfDoc(null); setPdfNumPages(0); setPdfPageIndex(0);
+    setEpubChapters([]); setEpubIndex(0);
+    setRawUnits([]); setEdits({});
+    setBody("");
+  }
+
+  // PDF: carica + estrai testo pagine
+  async function loadPdf(file) {
     const buf = await file.arrayBuffer();
     const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+    setPdfDoc(pdf);
+    setPdfNumPages(pdf.numPages);
+
     const pages = [];
     for (let i = 1; i <= pdf.numPages; i++) {
-      const page = await pdf.getPage(i);
-      const content = await page.getTextContent();
-      const text = content.items.map((it) => it.str).join(" ");
+      const p = await pdf.getPage(i);
+      const c = await p.getTextContent();
+      const text = c.items.map((it) => it.str).join(" ");
       pages.push(text);
     }
-    return pages;
+    setRawUnits(pages); // una entry per pagina
+    setBody(pages.join("\n\n")); // default: testo unito (non pulito)
   }
 
-  async function extractEpubText(file) {
+  // EPUB: carica + crea capitoli HTML (con immagini) + testo-only per editing
+  async function loadEpub(file) {
     const ab = await file.arrayBuffer();
     const zip = await JSZip.loadAsync(ab);
-    const htmlPaths = Object.keys(zip.files).filter((p) => /\.(xhtml|html|htm)$/i.test(p)).sort();
-    const texts = [];
-    for (const p of htmlPaths) {
-      const html = await zip.file(p).async("string");
-      texts.push(stripHtml(html));
+    const paths = Object.keys(zip.files).filter((p) => /\.(xhtml|html|htm)$/i.test(p)).sort();
+
+    // crea mapping risorse → Blob URL
+    const resourceUrl = {};
+    async function getResourceUrl(relPath, basePath) {
+      // risolve percorso relativo
+      let full = relPath;
+      if (!/^https?:/i.test(relPath)) {
+        const baseDir = basePath.split("/").slice(0, -1).join("/");
+        full = (baseDir ? baseDir + "/" : "") + relPath;
+      }
+      const f = zip.file(full);
+      if (!f) return relPath; // fallback
+      if (resourceUrl[full]) return resourceUrl[full];
+
+      const ext = full.split(".").pop().toLowerCase();
+      const mime =
+        ext === "png" ? "image/png" :
+        ext === "jpg" || ext === "jpeg" ? "image/jpeg" :
+        ext === "gif" ? "image/gif" :
+        ext === "svg" ? "image/svg+xml" :
+        ext === "css" ? "text/css" : "application/octet-stream";
+
+      const blob = new Blob([await f.async("arraybuffer")], { type: mime });
+      const url = URL.createObjectURL(blob);
+      resourceUrl[full] = url;
+      return url;
     }
-    return texts.join("\n\n");
+
+    const chapters = [];
+    for (const p of paths) {
+      const html = await zip.file(p).async("string");
+      const doc = new DOMParser().parseFromString(html, "text/html");
+
+      // risolvi immagini locali
+      const imgs = Array.from(doc.querySelectorAll("img[src]"));
+      // risolvi css link (opzionale)
+      const links = Array.from(doc.querySelectorAll("link[rel=stylesheet][href]"));
+
+      // eslint-disable-next-line no-await-in-loop
+      for (const img of imgs) {
+        const src = img.getAttribute("src");
+        // eslint-disable-next-line no-await-in-loop
+        const url = await getResourceUrl(src, p);
+        img.setAttribute("src", url);
+      }
+      for (const link of links) {
+        const href = link.getAttribute("href");
+        const url = await getResourceUrl(href, p);
+        // sostituisco il <link> con <style>@import url(...) per semplicità
+        const style = doc.createElement("style");
+        style.textContent = `@import url('${url}');`;
+        link.parentNode.replaceChild(style, link);
+      }
+
+      const htmlString = "<!doctype html>" + (doc.documentElement?.outerHTML || "");
+      const blob = new Blob([htmlString], { type: "text/html" });
+      const htmlBlobUrl = URL.createObjectURL(blob);
+
+      chapters.push({
+        path: p,
+        htmlBlobUrl,
+        textOnly: stripHtml(html),
+      });
+    }
+
+    setEpubChapters(chapters);
+    setRawUnits(chapters.map((c) => c.textOnly));
+    setBody(chapters.map((c) => c.textOnly).join("\n\n"));
   }
 
-  // ✅ Fix PULISCI: usa rawPages se ci sono, altrimenti spezza il body in paragrafi
+  // -------------- Rendering anteprima PDF --------------
+  useEffect(() => {
+    if (originalType !== "pdf" || !pdfDoc) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const pageNum = pdfPageIndex + 1;
+        const page = await pdfDoc.getPage(pageNum);
+        const viewport = page.getViewport({ scale: pdfScale });
+        const canvas = pdfCanvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext("2d");
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+
+        const renderContext = { canvasContext: ctx, viewport };
+        const task = page.render(renderContext);
+        await task.promise;
+        if (cancelled) return;
+      } catch (e) {
+        console.error(e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [originalType, pdfDoc, pdfPageIndex, pdfScale]);
+
+  // -------------- Editor selezione corrente --------------
+  const currentKey =
+    originalType === "pdf" ? `pdf:${pdfPageIndex}` :
+    originalType === "epub" ? `epub:${epubChapters[epubIndex]?.path || ""}` : "";
+
+  const currentOriginalText =
+    originalType === "pdf" ? (rawUnits[pdfPageIndex] || "") :
+    originalType === "epub" ? (epubChapters[epubIndex]?.textOnly || "") : "";
+
+  const currentEditedText = edits[currentKey] ?? currentOriginalText;
+  function saveCurrentEdit() {
+    if (!currentKey) return;
+    setEdits((prev) => ({ ...prev, [currentKey]: currentEditedText }));
+    alert("Modifica salvata per la selezione corrente.");
+  }
+
+  // Trova/Sostituisci sul selezionato
+  const [findText, setFindText] = useState("");
+  const [replaceText, setReplaceText] = useState("");
+  function applyReplace() {
+    if (!currentKey) return;
+    const target = edits[currentKey] ?? currentOriginalText;
+    if (!findText) return;
+    const re = new RegExp(findText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+    const replaced = target.replace(re, replaceText);
+    setEdits((prev) => ({ ...prev, [currentKey]: replaced }));
+  }
+
+  // Costruisci BODY dalle modifiche (senza pulizia)
+  function buildBodyFromEdits() {
+    if (originalType === "pdf") {
+      const arr = rawUnits.map((txt, i) => edits[`pdf:${i}`] ?? txt);
+      setBody(arr.join("\n\n"));
+    } else if (originalType === "epub") {
+      const arr = epubChapters.map((c) => edits[`epub:${c.path}`] ?? c.textOnly);
+      setBody(arr.join("\n\n"));
+    } else {
+      alert("Carica prima un PDF o EPUB.");
+    }
+  }
+
+  // —————— Pulizia automatica (opzionale) ——————
   function runCleanup() {
-    let pages = rawPages && rawPages.length ? rawPages.slice() : (body ? body.split(/\n{2,}/) : []);
+    let pages = rawUnits && rawUnits.length ? rawUnits.slice() : (body ? body.split(/\n{2,}/) : []);
     if (!pages.length) {
-      alert("Nessun testo da pulire: carica un PDF/EPUB o incolla testo nel box.");
+      alert("Nessun testo da pulire: carica un PDF/EPUB o incolla testo.");
       return;
     }
-    if (autoHF) pages = autoRemoveHeadersFooters(pages);
+    if (autoHF && originalType === "pdf") pages = autoRemoveHeadersFooters(pages);
     let t = pages.join("\n\n");
     if (stripPub) t = removePublisherLines(t);
     if (stripMarks) t = removeFootnoteMarkers(t);
@@ -164,7 +324,7 @@ export default function TextBook() {
     setBody(t);
   }
 
-  // Export PDF interno KDP
+  // —————— Impaginazione PDF finale ——————
   function exportPdf() {
     const { w: pageW, h: pageH } = calcBleedSize(trim.w, trim.h, bleed);
     const doc = new jsPDF({ unit: "in", format: [pageW, pageH], orientation: "portrait" });
@@ -241,36 +401,118 @@ export default function TextBook() {
   function addPageNumber(doc, pageNum, pageW, pageH) {
     doc.setFontSize(9);
     doc.text(String(pageNum), pageW / 2, pageH - 0.4, { align: "center" });
-    // torniamo a font body impostato fuori
   }
 
+  // —————— UI ——————
   return (
     <div className="p-4 space-y-4">
       <header className="flex flex-wrap items-end gap-3">
         <div>
           <h2 className="text-xl font-bold">Libro di Testo – PDF/EPUB</h2>
           <p className="text-sm text-neutral-600">
-            Importa, pulisci e re-impagina un'opera di pubblico dominio. (URL: <code>/#text</code>)
+            Anteprima originale (copertina, note, immagini). Modifica mirata senza pulizia. Poi impagina KDP.
           </p>
         </div>
         <div className="ml-auto flex items-center gap-2">
           <input type="file" accept=".pdf,.epub" onChange={onOpenFile} className="hidden" id="textbook-file" />
           <label htmlFor="textbook-file" className="px-3 py-2 rounded-xl border shadow-sm cursor-pointer">Carica PDF/EPUB</label>
+          <button className="px-3 py-2 rounded-xl border shadow-sm" onClick={buildBodyFromEdits}>Crea testo modificato (senza pulizia)</button>
           <button className="px-3 py-2 rounded-xl border shadow-sm" onClick={runCleanup}>Pulisci</button>
           <button className="px-4 py-2 rounded-2xl shadow bg-black text-white" onClick={exportPdf}>Esporta PDF</button>
         </div>
       </header>
 
-      <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* pulizia */}
-        <div className="bg-white rounded-2xl shadow p-4">
-          <h3 className="font-semibold mb-2">Pulizia automatica</h3>
-          <label className="block text-sm mb-1"><input type="checkbox" className="mr-2" checked={autoHF} onChange={(e)=>setAutoHF(e.target.checked)} /> Rimuovi header/footer ripetitivi</label>
-          <label className="block text-sm mb-1"><input type="checkbox" className="mr-2" checked={stripPub} onChange={(e)=>setStripPub(e.target.checked)} /> Rimuovi righe editore (©, ISBN, ecc.)</label>
-          <label className="block text-sm mb-1"><input type="checkbox" className="mr-2" checked={stripMarks} onChange={(e)=>setStripMarks(e.target.checked)} /> Rimuovi marcatori di nota ([1], (1), ^1)</label>
-          <label className="block text-sm"><input type="checkbox" className="mr-2" checked={stripNotes} onChange={(e)=>setStripNotes(e.target.checked)} /> Rimuovi blocchi “NOTE/APPARATI”</label>
+      {/* 1) ANTEPRIMA ORIGINALE */}
+      <section className="bg-white rounded-2xl shadow p-4">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="font-semibold">Anteprima originale</h3>
+          {originalType === "pdf" && (
+            <div className="flex items-center gap-2 text-sm">
+              <button className="px-2 py-1 border rounded" onClick={()=>setPdfPageIndex(Math.max(0, pdfPageIndex-1))}>◀</button>
+              <span>Pagina {pdfPageIndex+1} / {pdfNumPages || 0}</span>
+              <button className="px-2 py-1 border rounded" onClick={()=>setPdfPageIndex(Math.min(pdfNumPages-1, pdfPageIndex+1))}>▶</button>
+              <span className="ml-4">Zoom</span>
+              <input type="range" min="0.6" max="2" step="0.05" value={pdfScale} onChange={(e)=>setPdfScale(parseFloat(e.target.value)||1.25)} />
+              <span className="w-10 text-right">{Math.round(pdfScale*100)}%</span>
+            </div>
+          )}
+          {originalType === "epub" && (
+            <div className="flex items-center gap-2 text-sm">
+              <button className="px-2 py-1 border rounded" onClick={()=>setEpubIndex(Math.max(0, epubIndex-1))}>◀</button>
+              <span>Capitolo {epubIndex+1} / {epubChapters.length || 0}</span>
+              <button className="px-2 py-1 border rounded" onClick={()=>setEpubIndex(Math.min(epubChapters.length-1, epubIndex+1))}>▶</button>
+            </div>
+          )}
         </div>
 
+        {originalType === "pdf" && (
+          <div className="w-full overflow-auto border rounded-xl p-2">
+            <canvas ref={pdfCanvasRef} className="block mx-auto" />
+          </div>
+        )}
+
+        {originalType === "epub" && epubChapters[epubIndex] && (
+          <div className="w-full overflow-auto border rounded-xl p-2 h-[70vh]">
+            <iframe
+              title="EPUB preview"
+              src={epubChapters[epubIndex].htmlBlobUrl}
+              className="w-full h-full rounded"
+            />
+          </div>
+        )}
+
+        {!originalType && (
+          <p className="text-sm text-neutral-500">Carica un PDF o un EPUB per vedere l’anteprima completa (copertina, note, immagini).</p>
+        )}
+      </section>
+
+      {/* 2) EDITOR PAGINA/CAPITOLO SELEZIONATO (senza pulizia) */}
+      <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="bg-white rounded-2xl shadow p-4">
+          <h3 className="font-semibold mb-2">Editor (elemento selezionato)</h3>
+          <p className="text-xs text-neutral-600 mb-2">
+            {originalType === "pdf" ? `PDF – Pagina ${pdfPageIndex+1}` :
+             originalType === "epub" ? `EPUB – ${epubChapters[epubIndex]?.path || ""}` :
+             "Nessun file caricato"}
+          </p>
+
+          <textarea
+            value={currentEditedText}
+            onChange={(e) => setEdits((prev) => ({ ...prev, [currentKey]: e.target.value }))}
+            className="w-full h-[40vh] border rounded-xl px-3 py-2 whitespace-pre-wrap"
+            placeholder="Testo di questa pagina/capitolo..."
+          />
+
+          <div className="mt-3 flex items-end gap-3 flex-wrap">
+            <div>
+              <label className="block text-xs">Trova</label>
+              <input value={findText} onChange={(e)=>setFindText(e.target.value)} className="border rounded px-2 py-1" />
+            </div>
+            <div>
+              <label className="block text-xs">Sostituisci con</label>
+              <input value={replaceText} onChange={(e)=>setReplaceText(e.target.value)} className="border rounded px-2 py-1" />
+            </div>
+            <button className="px-3 py-2 border rounded-xl" onClick={applyReplace}>Sostituisci (solo selezionato)</button>
+            <button className="px-3 py-2 border rounded-xl" onClick={saveCurrentEdit}>Salva modifica</button>
+          </div>
+        </div>
+
+        {/* 3) Testo complessivo risultante */}
+        <div className="bg-white rounded-2xl shadow p-4">
+          <h3 className="font-semibold mb-2">Anteprima testo risultante</h3>
+          <p className="text-xs text-neutral-600 mb-2">
+            Questo è il testo su cui verrà fatta l’impaginazione. Puoi generarlo “senza pulizia” (da modifiche) o usare “Pulisci”.
+          </p>
+          <textarea
+            value={body}
+            onChange={(e)=>setBody(e.target.value)}
+            className="w-full h-[40vh] border rounded-xl px-3 py-2 whitespace-pre-wrap"
+          />
+        </div>
+      </section>
+
+      {/* 4) Impaginazione */}
+      <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         {/* layout */}
         <div className="bg-white rounded-2xl shadow p-4">
           <h3 className="font-semibold mb-2">Impaginazione</h3>
@@ -313,20 +555,14 @@ export default function TextBook() {
           <label className="block text-sm mb-1">Appendici / Bibliografia</label>
           <textarea value={bibliography} onChange={(e)=>setBibliography(e.target.value)} className="w-full h-24 border rounded-xl px-3 py-2"/>
         </div>
-      </section>
 
-      <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* pulizia opzion. */}
         <div className="bg-white rounded-2xl shadow p-4">
-          <h3 className="font-semibold mb-2">Anteprima testo (pulito)</h3>
-          <textarea value={body} onChange={(e)=>setBody(e.target.value)} className="w-full h-[50vh] border rounded-xl px-3 py-2 whitespace-pre-wrap" />
-        </div>
-        <div className="bg-white rounded-2xl shadow p-4">
-          <h3 className="font-semibold mb-2">Info origine</h3>
-          <p className="text-sm text-neutral-600">Pagine lette: {rawPages.length || 0}</p>
-          <ul className="text-xs text-neutral-500 list-disc ml-5 mt-2 space-y-1">
-            <li>Se il PDF è solo uno scan (immagini), qui non c’è OCR (possiamo aggiungerlo dopo).</li>
-            <li>Rimuovi eventuali apparati/introduzioni recenti non in pubblico dominio.</li>
-          </ul>
+          <h3 className="font-semibold mb-2">Pulizia automatica (opzionale)</h3>
+          <label className="block text-sm mb-1"><input type="checkbox" className="mr-2" checked={autoHF} onChange={(e)=>setAutoHF(e.target.checked)} /> Rimuovi header/footer ripetitivi (solo PDF)</label>
+          <label className="block text-sm mb-1"><input type="checkbox" className="mr-2" checked={stripPub} onChange={(e)=>setStripPub(e.target.checked)} /> Rimuovi righe editore (©, ISBN, ecc.)</label>
+          <label className="block text-sm mb-1"><input type="checkbox" className="mr-2" checked={stripMarks} onChange={(e)=>setStripMarks(e.target.checked)} /> Rimuovi marcatori nota ([1], (1), ^1)</label>
+          <label className="block text-sm"><input type="checkbox" className="mr-2" checked={stripNotes} onChange={(e)=>setStripNotes(e.target.checked)} /> Rimuovi blocchi “NOTE/APPARATI”</label>
         </div>
       </section>
     </div>
