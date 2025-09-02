@@ -13,6 +13,7 @@ const TRIMS = [
 // Bianco: 0.002252"  • Crema: 0.0025"  • Colore: 0.002347"
 const SPINE_PER_PAGE = { white: 0.002252, cream: 0.0025, color: 0.002347 };
 
+// Helpers
 function Num({ label, value, onChange, step = 1, min, max }) {
   return (
     <label className="block text-sm mb-1">
@@ -30,6 +31,22 @@ function Num({ label, value, onChange, step = 1, min, max }) {
   );
 }
 
+function imgFromDataURL(dataURL) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = dataURL;
+  });
+}
+
+function imageTypeForDataURL(dataURL) {
+  const m = /^data:image\/(png|jpeg|jpg)/i.exec(dataURL || "");
+  if (!m) return "JPEG";
+  const t = m[1].toLowerCase();
+  return t === "png" ? "PNG" : "JPEG";
+}
+
 export default function CoverDesigner() {
   const [trimKey, setTrimKey] = useState("8.25x11");
   const trim = useMemo(() => TRIMS.find((t) => t.key === trimKey) || TRIMS[0], [trimKey]);
@@ -44,6 +61,28 @@ export default function CoverDesigner() {
   const [front, setFront] = useState(null); // {src,img,w,h,scale,x,y}
   const [back, setBack] = useState(null);
 
+  // Carica PRIMA/QUARTA salvate da TextBook.jsx
+  useEffect(() => {
+    (async () => {
+      try {
+        const b = localStorage.getItem("kdp_cover_back");
+        const f = localStorage.getItem("kdp_cover_front");
+        if (b) {
+          const img = await imgFromDataURL(b);
+          setBack({ src: b, img, w: img.width, h: img.height, scale: 1, x: 0, y: 0 });
+          localStorage.removeItem("kdp_cover_back");
+        }
+        if (f) {
+          const img = await imgFromDataURL(f);
+          setFront({ src: f, img, w: img.width, h: img.height, scale: 1, x: 0, y: 0 });
+          localStorage.removeItem("kdp_cover_front");
+        }
+      } catch (e) {
+        console.warn("Errore caricando immagini dal localStorage:", e);
+      }
+    })();
+  }, []);
+
   const spine = useMemo(() => (pageCount > 0 ? pageCount * SPINE_PER_PAGE[paper] : 0), [pageCount, paper]);
   const fullW = (trim.w * 2) + spine + (bleed ? 0.25 : 0); // +0.125" sx +0.125" dx
   const fullH = trim.h + (bleed ? 0.25 : 0);               // +0.125" top +0.125" bottom
@@ -56,13 +95,11 @@ export default function CoverDesigner() {
 
   function loadSide(file, side) {
     const fr = new FileReader();
-    fr.onload = (e) => {
-      const img = new Image();
-      img.onload = () => {
-        const obj = { src: e.target.result, img, w: img.width, h: img.height, scale: 1, x: 0, y: 0 };
-        side === "front" ? setFront(obj) : setBack(obj);
-      };
-      img.src = e.target.result;
+    fr.onload = async (e) => {
+      const src = e.target.result;
+      const img = await imgFromDataURL(src);
+      const obj = { src, img, w: img.width, h: img.height, scale: 1, x: 0, y: 0 };
+      side === "front" ? setFront(obj) : setBack(obj);
     };
     fr.readAsDataURL(file);
   }
@@ -155,26 +192,30 @@ export default function CoverDesigner() {
     const mTop = bleed ? 0.125 : 0;
     const mLeft = bleed ? 0.125 : 0;
 
-    // RETRO
+    // Coordinate base delle aree in pollici
+    const backOriginX = mLeft + 0;
+    const backOriginY = mTop + 0;
+    const frontOriginX = mLeft + (trim.w + (bleed ? 0.125 : 0)) + spine;
+    const frontOriginY = mTop + 0;
+
+    // Disegna RETRO rispettando scala/offset
     if (back) {
-      try {
-        doc.addImage(back.src, "JPEG", mLeft + 0, mTop + 0, trim.w + (bleed ? 0.125 : 0), trim.h);
-      } catch {
-        try {
-          doc.addImage(back.src, "PNG", mLeft + 0, mTop + 0, trim.w + (bleed ? 0.125 : 0), trim.h);
-        } catch {}
-      }
+      const type = imageTypeForDataURL(back.src);
+      const wIn = (back.w * back.scale) / dpi;
+      const hIn = (back.h * back.scale) / dpi;
+      const xIn = backOriginX + (back.x / dpi);
+      const yIn = backOriginY + (back.y / dpi);
+      doc.addImage(back.src, type, xIn, yIn, wIn, hIn);
     }
-    // FRONTE
+
+    // Disegna FRONTE rispettando scala/offset
     if (front) {
-      const fx = mLeft + (trim.w + (bleed ? 0.125 : 0)) + spine;
-      try {
-        doc.addImage(front.src, "JPEG", fx, mTop + 0, trim.w + (bleed ? 0.125 : 0), trim.h);
-      } catch {
-        try {
-          doc.addImage(front.src, "PNG", fx, mTop + 0, trim.w + (bleed ? 0.125 : 0), trim.h);
-        } catch {}
-      }
+      const type = imageTypeForDataURL(front.src);
+      const wIn = (front.w * front.scale) / dpi;
+      const hIn = (front.h * front.scale) / dpi;
+      const xIn = frontOriginX + (front.x / dpi);
+      const yIn = frontOriginY + (front.y / dpi);
+      doc.addImage(front.src, type, xIn, yIn, wIn, hIn);
     }
 
     if (includeGuides) {
@@ -206,7 +247,6 @@ export default function CoverDesigner() {
       <header className="flex flex-wrap items-end gap-3">
         <div>
           <h2 className="text-xl font-bold">Designer Copertina – KDP</h2>
-          <p className="text-sm text-neutral-600">Calcola dorso e dimensioni con bleed. Carica fronte/retro, allinea con griglia, esporta PDF pronto KDP.</p>
         </div>
         <div className="ml-auto flex items-center gap-2">
           <button className="px-4 py-2 rounded-2xl shadow bg-black text-white" onClick={exportPdf}>Esporta PDF</button>
